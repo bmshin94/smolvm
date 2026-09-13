@@ -201,7 +201,7 @@ pub struct PackCreateCmd {
     #[arg(long = "from-vm", value_name = "VM_NAME")]
     pub from_vm: Option<String>,
 
-    /// For image-backed VMs created from a .smolmachine, rebuild lower layers from vm.image instead of preserving imported artifact layers.
+    /// Re-pull the base image instead of preserving cached or imported layers (may resolve a newer image tag).
     #[arg(long = "rebase-from-image", requires = "from_vm")]
     pub rebase_from_image: bool,
 
@@ -723,7 +723,11 @@ impl PackCreateCmd {
         // single-layer flatten).
         self.collect_base_assets(&mut collector)?;
         let export_opts = smolvm::pack_export::FromVmExportOptions {
-            proxy: self.proxy_opts.resolved_proxy()?,
+            proxy: if self.rebase_from_image {
+                self.proxy_opts.resolved_proxy()?
+            } else {
+                None
+            },
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
             include_workspace: self.include_workspace,

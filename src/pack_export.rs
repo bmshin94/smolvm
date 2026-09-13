@@ -36,8 +36,8 @@ pub struct FromVmExportOptions {
     pub proxy: Option<String>,
     /// NO_PROXY for the in-VM registry pull.
     pub no_proxy: Option<String>,
-    /// For artifact-sourced machines: rebuild base layers from `vm.image`
-    /// (re-pull from the registry) instead of preserving imported layers.
+    /// Rebuild base layers from `vm.image` (re-pull from the registry)
+    /// instead of preserving the machine's cached or imported layers.
     pub rebase_from_image: bool,
     /// Also capture the machine's `/workspace` so a machine made from the pack
     /// starts with those files. It lives on the storage disk, which container
@@ -360,7 +360,7 @@ impl ExportVm {
         let manager =
             AgentManager::for_vm_with_sizes(&scratch_name, Some(helper_storage_gib), None)?;
         let features = LaunchFeatures {
-            extra_disks: vec![(storage_disk, false, storage_fmt)],
+            extra_disks: vec![(storage_disk, true, storage_fmt)],
             packed_layers_dir,
             // Under per-VM uid isolation the source VM's dir is 0700/its-own-uid;
             // this helper's whole job is reading that VM's disks, so run it as
@@ -409,7 +409,8 @@ impl ExportVm {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage".to_string(),
+                "mkdir -p /mnt/source-storage && mount -o ro /dev/vdc /mnt/source-storage"
+                    .to_string(),
             ],
             vec![],
             None,
@@ -432,16 +433,21 @@ impl ExportVm {
 
 impl Drop for ExportVm {
     fn drop(&mut self) {
-        if let Err(e) = self.manager.stop() {
-            warn!(error = %e, "failed to stop pack temp VM");
+        // Only scratch disks are writable, and the exported bytes are already
+        // on the host. Flushing this disposable filesystem before deleting it
+        // can exceed the shutdown deadline after a large export.
+        self.manager.kill();
+        if self.manager.is_process_alive() {
+            warn!(path = %self.data_dir.display(), "export helper still alive; retaining scratch disks for cleanup");
+            return;
         }
+        self.manager.detach();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-/// Registry-image machine: pull the base image inside the helper VM (layers
-/// extract to its local disk), then flatten base layers + the machine's
-/// persistent container overlay into a single exported layer.
+/// Export the cached base image and persistent overlay without resolving tags
+/// again. Only an explicit rebase may replace the base from the registry.
 fn export_flattened_from_registry_image(
     collector: &mut AssetCollector,
     vm_name: &str,
@@ -450,20 +456,24 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<(Vec<String>, Option<String>)> {
-    let export_vm = ExportVm::start(vm_name, vm_dir, None, true)?;
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, opts.rebase_from_image)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
-    eprintln!("Pulling {} in export VM...", image);
-    let image_info = client.pull_with_registry_config_and_progress(
-        image,
-        None,
-        opts.proxy.as_deref(),
-        opts.no_proxy.as_deref(),
-        |_, _, _| {},
-    )?;
+    let image_info = if opts.rebase_from_image {
+        eprintln!("Pulling {} in export VM...", image);
+        client.pull_with_registry_config_and_progress(
+            image,
+            None,
+            opts.proxy.as_deref(),
+            opts.no_proxy.as_deref(),
+            |_, _, _| {},
+        )?
+    } else {
+        cached_export_image(&mut client, vm_name, image)?
+    };
 
-    // Lower dirs on the helper's own disk, bottom -> top as pulled.
+    // Lower dirs in the helper's store, bottom -> top in manifest order.
     let lowers: Vec<String> = image_info
         .layers
         .iter()
@@ -481,6 +491,150 @@ fn export_flattened_from_registry_image(
         opts.include_workspace,
     )?;
     Ok((image_info.env, image_info.user))
+}
+
+fn cached_export_image(
+    client: &mut AgentClient,
+    vm_name: &str,
+    image: &str,
+) -> crate::Result<smolvm_protocol::ImageInfo> {
+    // The source block device is read-only; the helper keeps its own writable
+    // storage for the flattened tar. Query validates config and layer markers.
+    let (code, _, stderr) = client.vm_exec(
+        vec![
+            "sh".into(),
+            "-ec".into(),
+            "for dir in layers configs manifests; do mount --bind /mnt/source-storage/$dir /storage/$dir; done".into(),
+        ],
+        vec![], None, None, None,
+    )?;
+    if code != 0 {
+        return Err(Error::agent(
+            "mount cached image",
+            String::from_utf8_lossy(&stderr),
+        ));
+    }
+    println!("Reusing the machine's cached image layers...");
+    client.query(image)?.ok_or_else(|| Error::agent(
+        "export cached image",
+        format!("machine '{vm_name}' has no complete cached image for '{image}'; restore its image cache before exporting, or explicitly rebase from the registry"),
+    ))
+}
+
+#[cfg(test)]
+mod cached_export_tests {
+    use super::*;
+    use crate::platform::uds::UdsStream;
+    use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+
+    fn exercise(
+        mount_code: i32,
+        response: AgentResponse,
+    ) -> crate::Result<smolvm_protocol::ImageInfo> {
+        let (stream, mut peer) = UdsStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut receive = || {
+                let mut header = [0; 4];
+                peer.read_exact(&mut header).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                peer.read_exact(&mut body).unwrap();
+                serde_json::from_slice::<Envelope<AgentRequest>>(&body)
+                    .unwrap()
+                    .body
+            };
+            match receive() {
+                AgentRequest::VmExec { command, .. } => {
+                    assert_eq!(command[0..2], ["sh", "-ec"]);
+                    assert!(
+                        command[2].contains("mount --bind /mnt/source-storage/$dir /storage/$dir")
+                    );
+                }
+                request => panic!("expected cache mounts, got {request:?}"),
+            }
+            peer.write_all(
+                &encode_message(&AgentResponse::Completed {
+                    exit_code: mount_code,
+                    stdout: vec![],
+                    stderr: b"mount failed".to_vec(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            if mount_code == 0 {
+                let mut header = [0; 4];
+                peer.read_exact(&mut header).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                peer.read_exact(&mut body).unwrap();
+                match serde_json::from_slice::<Envelope<AgentRequest>>(&body)
+                    .unwrap()
+                    .body
+                {
+                    AgentRequest::Query { image } => assert_eq!(image, "example:mutable"),
+                    request => panic!("must query the cache, not pull: {request:?}"),
+                }
+                peer.write_all(&encode_message(&response).unwrap()).unwrap();
+            }
+            let mut byte = [0];
+            assert_eq!(
+                peer.read(&mut byte).unwrap(),
+                0,
+                "unexpected fallback request"
+            );
+        });
+        let mut client = AgentClient::from_stream(stream);
+        let result = cached_export_image(&mut client, "source", "example:mutable");
+        drop(client);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn cached_export_preserves_layer_order_and_image_identity() {
+        let info = exercise(0, AgentResponse::Ok { data: Some(serde_json::json!({
+            "reference": "example:mutable", "digest": "sha256:original", "size": 123,
+            "created": null, "architecture": "amd64", "os": "linux", "layer_count": 2,
+            "layers": ["sha256:bottom", "sha256:top"], "env": ["ORIGINAL=yes"], "user": "1001",
+        })) }).unwrap();
+        assert_eq!(info.digest, "sha256:original");
+        assert_eq!(info.layers, ["sha256:bottom", "sha256:top"]);
+        assert_eq!(info.env, ["ORIGINAL=yes"]);
+        assert_eq!(info.user.as_deref(), Some("1001"));
+    }
+
+    #[test]
+    fn missing_cached_image_does_not_fall_back_to_registry() {
+        let error = exercise(
+            0,
+            AgentResponse::Error {
+                message: "not found".into(),
+                code: Some("NOT_FOUND".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no complete cached image"));
+    }
+
+    #[test]
+    fn invalid_cached_image_does_not_fall_back_to_registry() {
+        let error = exercise(
+            0,
+            AgentResponse::Error {
+                message: "invalid config".into(),
+                code: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid config"));
+    }
+
+    #[test]
+    fn cache_mount_failure_stops_export() {
+        let error = exercise(1, AgentResponse::Ok { data: None }).unwrap_err();
+        assert!(error.to_string().contains("mount failed"));
+    }
 }
 
 /// Artifact-sourced machine: its extracted layer dirs live in the host-side
