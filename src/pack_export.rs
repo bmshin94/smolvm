@@ -104,21 +104,6 @@ pub fn collect_from_vm_assets(
     opts: &FromVmExportOptions,
 ) -> crate::Result<FromVmAssets> {
     let overlay_owner = export_overlay_owner(vm_name, vm);
-    // A fork clone's disks are CoW qcow2 overlays that only the fork/resume
-    // machinery can assemble — the export helper cold-boots them and libkrun
-    // rejects the stack with an opaque -22 EINVAL (same class as clone
-    // auto-standby wake). Refuse with the real story until overlay-chain boot
-    // is supported.
-    if let Some(ref golden) = vm.golden {
-        return Err(Error::agent(
-            "pack from VM",
-            format!(
-                "machine '{vm_name}' is a fork clone of '{golden}'; its copy-on-write \
-                 disks cannot be exported directly. Export the golden instead, or \
-                 recreate the state in a non-clone machine and export that."
-            ),
-        ));
-    }
 
     let vm_dir = vm_data_dir(vm_name);
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
@@ -303,8 +288,8 @@ struct ExportVm {
 }
 
 impl ExportVm {
-    /// Boot a scratch agent VM with the source machine's storage disk attached
-    /// read-only as `/dev/vdc`, plus (optionally) a host layer dir shared as
+    /// Boot a scratch agent VM with a private COW view of the source storage
+    /// as `/dev/vdc`, plus (optionally) a host layer dir shared as
     /// `/packed_layers`.
     fn start(
         vm_name: &str,
@@ -359,8 +344,17 @@ impl ExportVm {
         // `VmResources` below tells the guest how large it is.
         let manager =
             AgentManager::for_vm_with_sizes(&scratch_name, Some(helper_storage_gib), None)?;
+        // Mounting ext4 can replay its journal and update metadata. Keep those
+        // writes in scratch storage, never in the stopped machine's disk.
+        let source_view = data_dir.join("export-source.qcow2");
+        if let Err(error) =
+            crate::agent::create_disk_overlays(&[(source_view.clone(), storage_disk, storage_fmt)])
+        {
+            let _ = std::fs::remove_dir_all(&data_dir);
+            return Err(error);
+        }
         let features = LaunchFeatures {
-            extra_disks: vec![(storage_disk, true, storage_fmt)],
+            extra_disks: vec![(source_view, false, DiskFormat::Qcow2)],
             packed_layers_dir,
             // Under per-VM uid isolation the source VM's dir is 0700/its-own-uid;
             // this helper's whole job is reading that VM's disks, so run it as
@@ -498,7 +492,7 @@ fn cached_export_image(
     vm_name: &str,
     image: &str,
 ) -> crate::Result<smolvm_protocol::ImageInfo> {
-    // The source block device is read-only; the helper keeps its own writable
+    // The source view is mounted read-only; the helper keeps separate writable
     // storage for the flattened tar. Query validates config and layer markers.
     let (code, _, stderr) = client.vm_exec(
         vec![

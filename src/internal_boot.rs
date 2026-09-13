@@ -416,11 +416,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         // configuring virtio-blk". Walk each disk's backing chain and grant
         // the files read-only. (The fork-restore boot path skips Landlock
         // entirely; this covers the plain stop -> start path.)
-        for disk in [&config.storage_disk_path, &config.overlay_disk_path] {
-            for backing in qcow2_backing_chain(disk) {
-                read_exec.push(backing);
-            }
-        }
+        read_exec.extend(boot_disk_backing_paths(
+            &config.storage_disk_path,
+            &config.overlay_disk_path,
+            &config.extra_disks,
+        ));
         for m in &config.mounts {
             if m.read_only {
                 read_exec.push(m.source.clone());
@@ -705,12 +705,21 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     crate::process::exit_child(1);
 }
 
-/// Resolve the qcow2 backing-file chain of `path`: if the file is a qcow2 with
-/// a backing file, return that path and recurse into it (bounded). Non-qcow2
-/// files, unreadable files, and files without a backing entry yield nothing.
-/// Used to pre-grant Landlock read access on every image the confined VMM's
-/// block layer will open — a fork clone's disks are backed by files in the
-/// golden's data dir, outside the clone's own granted paths.
+/// Grant backing-file reads for every attached disk, including export helpers.
+#[cfg(target_os = "linux")]
+fn boot_disk_backing_paths(
+    storage: &Path,
+    overlay: &Path,
+    extra_disks: &[(PathBuf, bool, DiskFormat)],
+) -> Vec<PathBuf> {
+    [storage, overlay]
+        .into_iter()
+        .chain(extra_disks.iter().map(|(path, _, _)| path.as_path()))
+        .flat_map(qcow2_backing_chain)
+        .collect()
+}
+
+/// Resolve a bounded qcow2 backing chain; raw and backing-less files add nothing.
 #[cfg(target_os = "linux")]
 fn qcow2_backing_chain(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     use std::io::{Read, Seek, SeekFrom};
@@ -763,7 +772,7 @@ fn qcow2_backing_chain(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod backing_chain_tests {
-    use super::qcow2_backing_chain;
+    use super::{boot_disk_backing_paths, qcow2_backing_chain, DiskFormat};
     use std::io::Write;
 
     fn fake_qcow2(
@@ -812,5 +821,26 @@ mod backing_chain_tests {
         );
         assert_eq!(qcow2_backing_chain(&relative), vec![raw.clone()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extra_disk_backings_are_granted_without_unrelated_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("source.raw");
+        std::fs::write(&raw, b"raw source").unwrap();
+        let golden = fake_qcow2(dir.path(), "golden.qcow2", Some(&raw));
+        let child = fake_qcow2(dir.path(), "child.qcow2", Some(&golden));
+        let primary = fake_qcow2(dir.path(), "primary.qcow2", None);
+        let _unrelated = fake_qcow2(dir.path(), "unrelated.qcow2", Some(&raw));
+        for read_only in [false, true] {
+            assert_eq!(
+                boot_disk_backing_paths(
+                    &primary,
+                    &primary,
+                    &[(child.clone(), read_only, DiskFormat::Qcow2)]
+                ),
+                vec![golden.clone(), raw.clone()]
+            );
+        }
     }
 }
