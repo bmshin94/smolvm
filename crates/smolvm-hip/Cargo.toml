@@ -1,0 +1,19 @@
+[package]
+name = "smolvm-hip"
+version = "0.1.0"
+edition = "2021"
+description = "HIP remoting protocol + client/host backend, mirroring smolvm-cuda"
+license = "Apache-2.0"
+
+[lib]
+name = "smolvm_hip"
+
+[features]
+default = []
+# host: pulls in the server-side dispatch (used by the host daemon binary).
+host = []
+# gpu: real HIP backend via libloading, dlopening libamdhip64.so. Implies host.
+gpu = ["host", "dep:libloading"]
+
+[dependencies]
+libloading = { version = "0.8", optional = true }

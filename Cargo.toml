@@ -8,6 +8,8 @@ members = [
     "crates/smolvm-cuda-codegen",
     "crates/smolvm-cudart-shim",
     "crates/smolvm-nvml-shim",
+    "crates/smolvm-hip",
+    "crates/smolvm-hip-shim",
     "crates/smolvm-network",
     "crates/smolvm-oci-layer",
     "crates/smolvm-pack",

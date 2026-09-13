@@ -196,10 +196,16 @@ pub mod ports {
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;
 
+    /// HIP-over-vsock (experimental, milestone 1 — see `smolvm-hip`): guest
+    /// HIP client forwards device-query/memory calls to a host HIP server
+    /// that runs them on the host AMD GPU.
+    pub const HIP: u32 = 7001;
+
     /// Base vsock port for user-published Unix-socket bridges
     /// (`--expose-socket` / `--mount-socket`). Each published socket is assigned
     /// `PUBLISH_SOCKET_BASE + index`. Kept clear of the fixed ports above (and of
-    /// CUDA at 7000) so a reasonable number of sockets never collides.
+    /// CUDA at 7000 / HIP at 7001) so a reasonable number of sockets never
+    /// collides.
     pub const PUBLISH_SOCKET_BASE: u32 = 6100;
 
     /// Maximum number of user-published sockets per VM. Bounds the vsock-port

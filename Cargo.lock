@@ -3228,6 +3228,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "smolvm-hip"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
+name = "smolvm-hip-shim"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "smolvm-hip",
+ "vsock",
+]
+
+[[package]]
 name = "smolvm-network"
 version = "1.16.0"
 dependencies = [
