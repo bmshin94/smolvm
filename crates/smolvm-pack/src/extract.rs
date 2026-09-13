@@ -1026,15 +1026,80 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Smallest cache the default sizing will ever choose, and the fallback when the
+/// filesystem's capacity can't be read. This was the whole cap before it scaled.
+const PACK_CACHE_MIN_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Share of the filesystem the extraction cache may use by default.
+const PACK_CACHE_DISK_FRACTION: u64 = 10;
+
 /// Maximum total size of the pack extraction cache before LRU eviction kicks in.
-/// Override with `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes); default 5 GiB.
-pub fn pack_cache_max_bytes() -> u64 {
-    const DEFAULT: u64 = 5 * 1024 * 1024 * 1024;
-    std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
+///
+/// Defaults to a tenth of the capacity of the filesystem holding `cache_root`,
+/// with [`PACK_CACHE_MIN_BYTES`] as a floor. A fixed cap cannot suit both ends of
+/// the range this runs on: 5 GiB is most of a laptop's spare room but a rounding
+/// error on a multi-terabyte host, where a pack over a gigabyte was evicted
+/// between one start and the next and re-extracted every time — turning a boot
+/// of about a second into tens of seconds. Scaling with the disk suits both.
+///
+/// `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes) still overrides, and is the escape
+/// hatch for a host that shares its disk with something else.
+pub fn pack_cache_max_bytes(cache_root: &Path) -> u64 {
+    if let Some(n) = std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT)
+    {
+        return n;
+    }
+    filesystem_capacity_bytes(cache_root)
+        .map(|total| (total / PACK_CACHE_DISK_FRACTION).max(PACK_CACHE_MIN_BYTES))
+        .unwrap_or(PACK_CACHE_MIN_BYTES)
+}
+
+/// Total capacity (not free space) of the filesystem holding `path`, or `None`
+/// when it can't be determined — an unwritten path, an unsupported platform, or
+/// a failing syscall. Capacity rather than free space on purpose: a cap derived
+/// from free space shrinks as the disk fills, which would tighten the cache
+/// exactly when eviction is already churning and make the thrash worse.
+fn filesystem_capacity_bytes(path: &Path) -> Option<u64> {
+    // The cache root may not exist yet on a first extraction; the nearest
+    // existing ancestor sits on the same filesystem, which is what we're after.
+    let mut probe = path;
+    loop {
+        if probe.exists() {
+            break;
+        }
+        probe = probe.parent()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c_path` is a valid NUL-terminated string for the duration of
+        // the call, and `stat` is only read after statvfs reports success.
+        unsafe {
+            let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+            if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) != 0 {
+                return None;
+            }
+            let stat = stat.assume_init();
+            // `f_blocks`/`f_frsize` are `c_ulong` on some targets and already
+            // `u64` on others, so the widening is a no-op on exactly the
+            // platforms where clippy notices it.
+            #[allow(clippy::unnecessary_cast)]
+            let total = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64)?;
+            (total > 0).then_some(total)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = probe;
+        None
+    }
 }
 
 /// Maximum number of entries `safe_unpack` will extract from a single archive
@@ -1299,7 +1364,7 @@ fn extract_sidecar_capped(
             // vcpu BadActivate). A torch pack (~13 GiB) alone exceeds the 5 GiB
             // default cap, which is exactly when oldest-first eviction reaches it.
             let freed =
-                evict_cache_to_size_protecting(root, pack_cache_max_bytes(), Some(cache_dir));
+                evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
             if freed > 0 && debug {
                 eprintln!("debug: pack cache evicted {freed} bytes to stay under cap");
             }
@@ -4821,6 +4886,65 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "after");
         assert!(!dest.join("unknown-type-entry").exists());
+    }
+
+    /// `SMOLVM_PACK_CACHE_MAX_BYTES` is process-global, so the tests that set and
+    /// clear it must not run concurrently with the one that reads the default.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The cap must track the disk, not a constant: a fixed 5 GiB evicted a pack
+    /// between one start and the next on a large host, so each boot re-extracted
+    /// it. Asserted against the real filesystem the test runs on.
+    #[test]
+    fn cache_cap_scales_with_the_filesystem_it_lives_on() {
+        let dir = tempfile::tempdir().unwrap();
+        // Serialised with the override test below: both touch the same env var.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SMOLVM_PACK_CACHE_MAX_BYTES");
+
+        let cap = pack_cache_max_bytes(dir.path());
+        assert!(
+            cap >= PACK_CACHE_MIN_BYTES,
+            "the cap must never fall below the old fixed default, got {cap}"
+        );
+        if let Some(total) = filesystem_capacity_bytes(dir.path()) {
+            // A big disk must yield a bigger cache than the old constant did.
+            if total / PACK_CACHE_DISK_FRACTION > PACK_CACHE_MIN_BYTES {
+                assert!(
+                    cap > PACK_CACHE_MIN_BYTES,
+                    "a {total}-byte filesystem should give more than the {PACK_CACHE_MIN_BYTES}-byte floor, got {cap}"
+                );
+            }
+            assert!(
+                cap <= total,
+                "the cache may never be allowed to exceed the whole filesystem"
+            );
+        }
+    }
+
+    /// An operator sharing the disk with something else must still be able to pin
+    /// the cache, including to a value below the floor.
+    #[test]
+    fn explicit_override_beats_the_disk_derived_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SMOLVM_PACK_CACHE_MAX_BYTES", "1048576");
+        let cap = pack_cache_max_bytes(dir.path());
+        std::env::remove_var("SMOLVM_PACK_CACHE_MAX_BYTES");
+        assert_eq!(cap, 1024 * 1024, "an explicit cap must win outright");
+    }
+
+    /// A cache root that does not exist yet (first extraction) must still size
+    /// from the filesystem it is about to be created on, not fall to the floor.
+    #[test]
+    fn sizes_from_the_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let unborn = dir.path().join("not").join("created").join("yet");
+        assert_eq!(
+            filesystem_capacity_bytes(&unborn),
+            filesystem_capacity_bytes(dir.path()),
+            "an unwritten cache root must resolve to its filesystem"
+        );
     }
 
     // Sets directory mtimes via libc::utimes to drive the LRU ordering, so it
