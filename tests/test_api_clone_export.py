@@ -39,6 +39,13 @@ def main():
         call("POST", "", {"name": source, "image": "ubuntu:24.04", "network": True,
             "cpus": 2, "memoryMb": 1024, "storageGb": 4, "cmd": ["sleep", "infinity"]})
         call("POST", "/" + source + "/start?branchable=true")
+        if os.environ.get("QA_REQUIRE_UID"):
+            pid = call("GET", "/" + source)["pid"]
+            status = Path(f"/proc/{pid}/status").read_text()
+            uid = next(line for line in status.splitlines() if line.startswith("Uid:")).split()[2]
+            assert int(uid) >= 2_000_000, status
+            assert "smolvm-vm-" in Path(f"/proc/{pid}/cgroup").read_text()
+            print("PASS source uses per-VM UID and systemd scope", flush=True)
         execute(source, "echo parent >/root/export-witness; echo remove >/root/delete-in-child")
         call("POST", "/" + source + "/branches", {"name": child, "branchable": True})
         execute(child, "echo child >/root/export-witness; rm /root/delete-in-child; "
