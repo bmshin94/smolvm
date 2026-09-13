@@ -259,12 +259,46 @@ pub async fn capture_portable_checkpoint(
 }
 
 /// Create a machine by streaming a `.smolcheckpoint` into this node.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RestoreCheckpointQuery {
+    /// JSON port mappings for this host; guest ports must match the checkpoint.
+    pub ports: Option<String>,
+}
+
+fn checkpoint_host_ports(
+    captured: &[PortSpec],
+    requested: &[PortSpec],
+) -> Result<Vec<PortSpec>, ApiError> {
+    if requested.is_empty() {
+        return Ok(captured.to_vec());
+    }
+    let mut old_guests: Vec<_> = captured.iter().map(|port| port.guest).collect();
+    let mut new_guests: Vec<_> = requested.iter().map(|port| port.guest).collect();
+    old_guests.sort_unstable();
+    new_guests.sort_unstable();
+    if old_guests != new_guests {
+        return Err(ApiError::BadRequest(
+            "checkpoint port overrides must preserve the captured guest ports".into(),
+        ));
+    }
+    Ok(requested.to_vec())
+}
+
+/// Import a live checkpoint, optionally rebinding its host-side published ports.
 pub async fn restore_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(options): Query<RestoreCheckpointQuery>,
     request: axum::extract::Request,
 ) -> Result<Json<MachineInfo>, ApiError> {
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    let ports: Vec<PortSpec> = options
+        .ports
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| ApiError::BadRequest(format!("invalid restore ports: {error}")))?
+        .unwrap_or_default();
     let transfer = tempfile::Builder::new()
         .prefix("checkpoint-restore-")
         .tempdir_in(checkpoint_transfer_root()?)
@@ -307,6 +341,7 @@ pub async fn restore_portable_checkpoint(
     let request: CreateMachineRequest = serde_json::from_value(serde_json::json!({
         "name": name,
         "from": artifact.to_string_lossy(),
+        "ports": ports,
     }))
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
@@ -833,7 +868,7 @@ pub async fn create_machine(
         .as_ref()
         .and_then(|checkpoint| checkpoint.overlay_gib)
         .or(req.overlay_gb);
-    let restored_ports: Vec<PortSpec> = checkpoint_network
+    let captured_ports: Vec<PortSpec> = checkpoint_network
         .map(|network| {
             network
                 .ports
@@ -845,6 +880,11 @@ pub async fn create_machine(
                 .collect()
         })
         .unwrap_or_else(|| req.ports.clone());
+    let restored_ports = if manifest_checkpoint.is_some() {
+        checkpoint_host_ports(&captured_ports, &req.ports)?
+    } else {
+        captured_ports
+    };
     let restored_network_backend = match manifest_checkpoint.as_ref() {
         Some(checkpoint) => crate::portable_checkpoint::restored_network_backend(checkpoint)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
@@ -871,7 +911,6 @@ pub async fn create_machine(
         }
         if !host_mount_specs.is_empty()
             || !remote_volumes.is_empty()
-            || !req.ports.is_empty()
             || req.network
             || req.gpu
             || req.cuda
@@ -3442,6 +3481,47 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn checkpoint_ports_allow_host_rebinding_but_preserve_guest_topology() {
+        let captured = vec![
+            PortSpec {
+                host: 30001,
+                guest: 8080,
+            },
+            PortSpec {
+                host: 30002,
+                guest: 3000,
+            },
+        ];
+        let requested = vec![
+            PortSpec {
+                host: 31002,
+                guest: 3000,
+            },
+            PortSpec {
+                host: 31001,
+                guest: 8080,
+            },
+        ];
+        let ports = checkpoint_host_ports(&captured, &requested).unwrap();
+        assert_eq!(ports[0].host, 31002);
+        assert_eq!(ports[1].host, 31001);
+        assert_eq!(
+            checkpoint_host_ports(&captured, &[]).unwrap()[0].host,
+            30001
+        );
+        assert!(checkpoint_host_ports(&captured, &requested[..1]).is_err());
+        assert!(checkpoint_host_ports(
+            &captured,
+            &[PortSpec {
+                host: 31001,
+                guest: 9090
+            }]
+        )
+        .is_err());
+        assert!(checkpoint_host_ports(&[], &requested).is_err());
+    }
 
     #[tokio::test]
     async fn bounded_futures_stream_results_without_exceeding_the_limit() {

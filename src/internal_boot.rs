@@ -696,14 +696,10 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
 
     // If we get here, launch_agent_vm returned (should only happen on error)
     if let Err(ref e) = result {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.startup_error_log)
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "{e}")
-            });
+        // Stderr was opened before the UID drop. Reopening its root-owned
+        // path here can fail, silently losing the actual startup error.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "Error: {e}");
     }
 
     crate::process::exit_child(1);

@@ -99,7 +99,13 @@ impl TcpPortListeners {
                 Ok(listener) => listener,
                 Err(err) => {
                     shutdown_all(&shutdown, &mut handles);
-                    return Err(err);
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!(
+                            "cannot publish host TCP {publish_addr}:{} to guest TCP {}: {err}",
+                            mapping.host, mapping.guest,
+                        ),
+                    ));
                 }
             };
             let listener_v6 = match TcpListener::bind((publish_v6, mapping.host)) {
