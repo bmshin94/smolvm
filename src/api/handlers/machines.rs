@@ -1733,11 +1733,16 @@ pub async fn start_machine(
             // clears) and deletable — then surface the pull failure.
             let st = pid.and_then(process_start_time);
             let name_rb = name.clone();
-            tokio::task::spawn_blocking(move || {
-                shutdown_machine_process(&name_rb, pid, st, false);
+            let stopped = tokio::task::spawn_blocking(move || {
+                shutdown_machine_process(&name_rb, pid, st, false)
             })
             .await
-            .ok();
+            .unwrap_or(false);
+            if stopped {
+                reconcile_confirmed_stopped_machine(&state, &name, false).await?;
+            } else {
+                tracing::warn!(machine = %name, "image pull failed and VM teardown is incomplete; retaining the launch lock");
+            }
             return Err(e);
         }
         // Launch the workload container. Best-effort past the pull: a transient
