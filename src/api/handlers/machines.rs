@@ -1728,8 +1728,8 @@ pub async fn start_machine(
             // the booted VM as an untracked orphan — its pid never reaches the
             // record, and a later delete then reports "process still alive after
             // shutdown; not removing" while the VM leaks. Tear the VM down so the
-            // machine is left exactly like a never-started one (`created`, no live
-            // process) — cleanly retryable (e.g. once a transient registry outage
+            // machine is stopped with no live process and is cleanly retryable
+            // (e.g. once a transient registry outage
             // clears) and deletable — then surface the pull failure.
             let st = pid.and_then(process_start_time);
             let name_rb = name.clone();
