@@ -1463,7 +1463,7 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
         .write(true)
         .open(path)
         .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
-    let mut header = [0_u8; 20];
+    let mut header = [0_u8; 104];
     file.read_exact(&mut header)
         .map_err(|error| Error::agent("read qcow2 header", error.to_string()))?;
     if header[..4] != *b"QFI\xfb" {
@@ -1474,7 +1474,21 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
     }
     let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
     let old_len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-    if offset == 0 || old_len == 0 || backing.len() > old_len {
+    let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    let cluster_bits = u32::from_be_bytes(header[20..24].try_into().unwrap());
+    let header_len = match version {
+        2 => 72,
+        3 => u64::from(u32::from_be_bytes(header[100..104].try_into().unwrap())),
+        _ => 0,
+    };
+    if !(9..=21).contains(&cluster_bits)
+        || header_len < if version == 3 { 104 } else { 72 }
+        || offset < header_len
+        || old_len == 0
+        || old_len > 1023
+        || backing.is_empty()
+        || backing.len() > 1023
+    {
         return Err(Error::agent(
             "rewrite qcow2 backing",
             format!(
@@ -1486,22 +1500,62 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
         ));
     }
     let end = offset
-        .checked_add(old_len as u64)
+        .checked_add(old_len.max(backing.len()) as u64)
         .ok_or_else(|| Error::agent("rewrite qcow2 backing", "header offset overflow"))?;
-    if end
-        > file
-            .metadata()
-            .map_err(|e| Error::agent("inspect qcow2", e.to_string()))?
-            .len()
+    if end > (1_u64 << cluster_bits)
+        || end
+            > file
+                .metadata()
+                .map_err(|e| Error::agent("inspect qcow2", e.to_string()))?
+                .len()
     {
         return Err(Error::agent(
             "rewrite qcow2 backing",
-            "backing filename lies outside the qcow2 file",
+            "backing filename lies outside the qcow2 header cluster or file",
         ));
+    }
+    // QCOW2 stores extensions before the backing name, which may grow into
+    // the remaining first-cluster padding. Never overwrite another cluster
+    // or non-padding bytes when rebasing a staged copy.
+    let mut extension = header_len;
+    while extension < offset {
+        if offset - extension < 8 {
+            return Err(Error::agent(
+                "rewrite qcow2 backing",
+                "truncated header extension",
+            ));
+        }
+        let mut ext = [0_u8; 8];
+        file.seek(SeekFrom::Start(extension))
+            .and_then(|_| file.read_exact(&mut ext))
+            .map_err(|e| Error::agent("read qcow2 extension", e.to_string()))?;
+        if ext[..4] == [0; 4] {
+            break;
+        }
+        let size = u64::from(u32::from_be_bytes(ext[4..8].try_into().unwrap()));
+        extension += 8 + ((size + 7) & !7);
+        if extension > offset {
+            return Err(Error::agent(
+                "rewrite qcow2 backing",
+                "backing filename overlaps a header extension",
+            ));
+        }
+    }
+    if backing.len() > old_len {
+        let mut padding = vec![0_u8; backing.len() - old_len];
+        file.seek(SeekFrom::Start(offset + old_len as u64))
+            .and_then(|_| file.read_exact(&mut padding))
+            .map_err(|e| Error::agent("read qcow2 padding", e.to_string()))?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(Error::agent(
+                "rewrite qcow2 backing",
+                "backing filename would overwrite non-padding bytes",
+            ));
+        }
     }
     file.seek(SeekFrom::Start(offset))
         .and_then(|_| file.write_all(backing.as_bytes()))
-        .and_then(|_| file.write_all(&vec![0_u8; old_len - backing.len()]))
+        .and_then(|_| file.write_all(&vec![0_u8; old_len.saturating_sub(backing.len())]))
         .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
     file.seek(SeekFrom::Start(16))
         .and_then(|_| file.write_all(&(backing.len() as u32).to_be_bytes()))
@@ -1512,7 +1566,7 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
 
 /// Stage exact, self-contained disk chains without flattening them.
 ///
-/// Each qcow2 layer is copied as-is and rebased to a one-character relative
+/// Each qcow2 layer is copied as-is and rebased to a reserved relative
 /// filename. This preserves the block backend's allocation/topology state,
 /// avoids multi-gigabyte logical scans, and prevents restored images from
 /// retaining absolute references to the capture host.
@@ -2581,6 +2635,91 @@ mod tests {
             std::fs::metadata(&source).unwrap().ino(),
             std::fs::metadata(&raw_staged).unwrap().ino()
         );
+    }
+
+    fn qcow2_header_fixture() -> Vec<u8> {
+        let old = disk_target("storage", 9, "qcow2").unwrap();
+        let mut bytes = vec![0_u8; 8192];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        bytes[8..16].copy_from_slice(&128_u64.to_be_bytes());
+        bytes[16..20].copy_from_slice(&(old.len() as u32).to_be_bytes());
+        bytes[20..24].copy_from_slice(&12_u32.to_be_bytes());
+        bytes[100..104].copy_from_slice(&104_u32.to_be_bytes());
+        bytes[128..128 + old.len()].copy_from_slice(old.as_bytes());
+        bytes[4096..].fill(0xa5);
+        bytes
+    }
+
+    #[test]
+    fn checkpoint_backing_name_can_grow_across_ten_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.qcow2");
+        let new = disk_target("storage", 10, "qcow2").unwrap();
+        let mut bytes = qcow2_header_fixture();
+        std::fs::write(&path, &bytes).unwrap();
+
+        rewrite_qcow2_backing(&path, &new).unwrap();
+
+        bytes[16..20].copy_from_slice(&(new.len() as u32).to_be_bytes());
+        bytes[128..128 + new.len()].copy_from_slice(new.as_bytes());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        rewrite_qcow2_backing(&path, "x").unwrap();
+        bytes[16..20].copy_from_slice(&1_u32.to_be_bytes());
+        bytes[128..128 + new.len()].fill(0);
+        bytes[128] = b'x';
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn checkpoint_backing_growth_reopens_with_qcow2_driver() {
+        use imago::FormatCreateBuilder;
+
+        let image = tempfile::NamedTempFile::new().unwrap();
+        let file = ImagoFile::try_from(image.reopen().unwrap()).unwrap();
+        let builder = Qcow2::<ImagoFile>::create_builder(file)
+            .size(1024 * 1024)
+            .backing("a".to_string(), "raw".to_string());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(builder.create())
+            .unwrap();
+        let before = std::fs::read(image.path()).unwrap();
+        let target = disk_target("storage", 10, "raw").unwrap();
+        rewrite_qcow2_backing(image.path(), &target).unwrap();
+        assert_eq!(
+            inspect_qcow2(image.path()).unwrap(),
+            (Some(target), Some("raw".to_string()))
+        );
+        let after = std::fs::read(image.path()).unwrap();
+        assert_eq!(&before[65536..], &after[65536..]);
+    }
+
+    #[test]
+    fn checkpoint_backing_rewrite_rejects_unsafe_growth_without_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.qcow2");
+        let new = disk_target("storage", 10, "qcow2").unwrap();
+        for case in 0..8 {
+            let mut bytes = qcow2_header_fixture();
+            match case {
+                0 => bytes[159] = 1, // Growth would overwrite non-padding data.
+                1 => bytes[8..16].copy_from_slice(&4090_u64.to_be_bytes()),
+                2 => bytes[20..24].copy_from_slice(&64_u32.to_be_bytes()),
+                3 => bytes[8..16].copy_from_slice(&32_u64.to_be_bytes()),
+                4 => bytes[100..104].copy_from_slice(&4096_u32.to_be_bytes()),
+                5 => bytes[4..8].copy_from_slice(&4_u32.to_be_bytes()),
+                6 => bytes.truncate(159),
+                7 => {
+                    bytes[104..108].copy_from_slice(&1_u32.to_be_bytes());
+                    bytes[108..112].copy_from_slice(&32_u32.to_be_bytes());
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(rewrite_qcow2_backing(&path, &new).is_err(), "case {case}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "case {case}");
+        }
     }
 
     #[test]
