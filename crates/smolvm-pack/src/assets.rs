@@ -930,6 +930,21 @@ impl AssetCollector {
     /// (two-file mode: libs are embedded in the stub binary instead).
     /// When false, everything is included (single-file mode).
     pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
+        let output_file = self.compress_with(|| File::create(output), exclude_libs)?;
+        Ok(output_file.metadata()?.len())
+    }
+
+    /// Compress into an owned writer so callers can checksum bytes as they are
+    /// emitted instead of copying and rereading a multi-GiB archive.
+    pub(crate) fn compress_to<W: Write>(&self, output: W, exclude_libs: bool) -> Result<W> {
+        self.compress_with(|| Ok(output), exclude_libs)
+    }
+
+    fn compress_with<W: Write>(
+        &self,
+        output: impl FnOnce() -> std::io::Result<W>,
+        exclude_libs: bool,
+    ) -> Result<W> {
         // One asset compressor per cache root, including API subprocesses.
         // The permit also covers finish(), which drains outstanding zstd jobs.
         let cache = dirs::cache_dir()
@@ -941,8 +956,7 @@ impl AssetCollector {
                 cache.display()
             ))
         })?;
-        let output_file = File::create(output)?;
-        let mut encoder = zstd::stream::Encoder::new(output_file, ZSTD_LEVEL)
+        let mut encoder = zstd::stream::Encoder::new(output()?, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
         let workers = compression_workers(
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
@@ -987,10 +1001,7 @@ impl AssetCollector {
             .map_err(|e| PackError::Tar(e.to_string()))?;
         encoder
             .finish()
-            .map_err(|e| PackError::Compression(e.to_string()))?;
-
-        let metadata = fs::metadata(output)?;
-        Ok(metadata.len())
+            .map_err(|e| PackError::Compression(e.to_string()))
     }
 }
 
