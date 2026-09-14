@@ -266,7 +266,38 @@ fn replace_checkpoint_cache_entry(
     let staging = tempfile::tempdir_in(parent)?;
     let link = staging.path().join("artifact");
     std::fs::hard_link(artifact, &link)?;
+    let _lock = lock_checkpoint_cache_namespace(parent)?;
     std::fs::rename(link, destination)
+}
+
+const CHECKPOINT_CACHE_LOCK: &str = ".checkpoint-cache.lock";
+
+fn lock_checkpoint_cache_namespace(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(CHECKPOINT_CACHE_LOCK))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn discard_invalid_checkpoint_cache_entry(src: &std::path::Path) -> std::io::Result<()> {
+    let parent = src
+        .parent()
+        .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
+    let _lock = lock_checkpoint_cache_namespace(parent)?;
+    // A publisher may have replaced the entry since the reader pinned it.
+    // Recheck under the publication lock before removing the current name.
+    if crate::portable_checkpoint::verified_sidecar_footer(src).is_err() {
+        match std::fs::remove_file(src) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Look `key` up; on a hit, hard-link the entry to `artifact` (a fresh path in a
@@ -297,7 +328,9 @@ fn take_checkpoint_cache_entry(
             "discarding invalid cached checkpoint; retrying supplied source"
         );
         let _ = std::fs::remove_file(artifact);
-        let _ = std::fs::remove_file(src);
+        if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
+            tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
+        }
         return false;
     }
     // Touch so eviction sees this entry as recently used.
@@ -317,6 +350,9 @@ fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
     let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
+            if e.file_name() == CHECKPOINT_CACHE_LOCK {
+                return None;
+            }
             let meta = e.metadata().ok()?;
             meta.is_file().then(|| {
                 (
@@ -541,9 +577,50 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
 #[cfg(test)]
 mod checkpoint_cache_tests {
     use super::{
-        checkpoint_cache_evict, checkpoint_cache_path, replace_checkpoint_cache_entry,
+        checkpoint_cache_evict, checkpoint_cache_path, discard_invalid_checkpoint_cache_entry,
+        lock_checkpoint_cache_namespace, replace_checkpoint_cache_entry,
         take_checkpoint_cache_entry,
     };
+
+    #[test]
+    fn stale_invalid_reader_does_not_remove_repaired_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let reader = dir.path().join("reader");
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&cached, b"invalid").unwrap();
+        std::fs::hard_link(&cached, &reader).unwrap();
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://cache-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&replacement)
+            .unwrap();
+        replace_checkpoint_cache_entry(&replacement, &cached).unwrap();
+        assert!(crate::portable_checkpoint::verified_sidecar_footer(&reader).is_err());
+        discard_invalid_checkpoint_cache_entry(&cached).unwrap();
+        assert!(crate::portable_checkpoint::verified_sidecar_footer(&cached).is_ok());
+        assert_eq!(std::fs::read(reader).unwrap(), b"invalid");
+    }
+
+    #[test]
+    fn eviction_preserves_namespace_lock_and_pinned_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let pinned = pinned_dir.path().join("reader");
+        std::fs::write(&cached, b"payload").unwrap();
+        std::fs::hard_link(&cached, &pinned).unwrap();
+        let lock = lock_checkpoint_cache_namespace(dir.path()).unwrap();
+        checkpoint_cache_evict(dir.path(), 0);
+        assert!(!cached.exists());
+        assert!(dir.path().join(super::CHECKPOINT_CACHE_LOCK).exists());
+        assert_eq!(std::fs::read(pinned).unwrap(), b"payload");
+        drop(lock);
+    }
 
     #[test]
     fn invalid_cache_hit_is_removed_before_fresh_upload() {
