@@ -348,6 +348,7 @@ impl ExportVm {
         // `VmResources` below tells the guest how large it is.
         let manager =
             AgentManager::for_vm_with_sizes(&scratch_name, Some(helper_storage_gib), None)?;
+        std::fs::write(data_dir.join(EXPORT_SCRATCH_MARKER), &scratch_name)?;
         // Mounting ext4 can replay its journal and update metadata. Keep those
         // writes in scratch storage, never in the stopped machine's disk.
         let source_view = data_dir.join("export-source.qcow2");
@@ -508,20 +509,31 @@ fn disk_virtual_size(path: &Path, format: DiskFormat) -> Option<u64> {
 /// cleaned up by hand, but nothing ever came back for them. Each one is as large
 /// as the export that failed, so a few failed exports in a row is enough to take
 /// a host's free space with them — and the next export then fails for lack of
-/// space rather than for its own reason. The directory's name carries the pid
-/// that created it, so one whose creator is gone is unambiguously finished.
+/// space rather than for its own reason. Creator death alone is insufficient:
+/// the helper can outlive its creator and still have these disks open.
 fn reap_stale_export_scratch() {
     reap_stale_export_scratch_in(&crate::agent::vm_cache_root());
 }
 
-/// Lower-level form of [`reap_stale_export_scratch`] that operates on an
-/// explicit directory. Factored out for testability — callers in production
-/// should use [`reap_stale_export_scratch`].
+const EXPORT_SCRATCH_MARKER: &str = ".export-scratch";
+
+#[cfg(unix)]
+fn process_definitely_gone(pid: crate::process::Pid) -> bool {
+    pid > 0
+        && unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
 fn reap_stale_export_scratch_in(root: &Path) {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let dir = entry.path();
         let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
             continue;
@@ -534,7 +546,32 @@ fn reap_stale_export_scratch_in(root: &Path) {
         else {
             continue;
         };
-        if crate::process::is_alive(pid) {
+        // Names alone do not identify internal scratch: users can choose the
+        // same prefix. Old, unmarked directories require manual cleanup.
+        if std::fs::read_to_string(dir.join(EXPORT_SCRATCH_MARKER))
+            .ok()
+            .as_deref()
+            != Some(name.trim_end())
+            || !process_definitely_gone(pid)
+        {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join("vm.lock"))
+        else {
+            continue;
+        };
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        // The launch lock belongs to the creator, not the helper. Check the
+        // recorded helper too, under the lock, and retain ambiguous state.
+        let helper_pid = std::fs::read_to_string(dir.join("agent.pid"))
+            .ok()
+            .and_then(|text| text.lines().next()?.trim().parse().ok());
+        if !helper_pid.is_some_and(process_definitely_gone) {
             continue;
         }
         match std::fs::remove_dir_all(&dir) {
@@ -549,6 +586,10 @@ fn reap_stale_export_scratch_in(root: &Path) {
         }
     }
 }
+
+// Retain scratch until equivalent nonblocking launch-lock checks are available.
+#[cfg(not(unix))]
+fn reap_stale_export_scratch_in(_root: &Path) {}
 
 impl Drop for ExportVm {
     fn drop(&mut self) {
@@ -1532,12 +1573,15 @@ mod export_scratch_tests {
     use crate::storage::DiskFormat;
 
     /// A pid far above any system's maximum, so it is reliably not running.
-    const DEAD_PID: u32 = 4_194_303;
+    const DEAD_PID: u32 = i32::MAX as u32;
 
     fn scratch(root: &std::path::Path, dir: &str, name: &str) -> std::path::PathBuf {
         let path = root.join(dir);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("name"), name).unwrap();
+        std::fs::write(path.join(super::EXPORT_SCRATCH_MARKER), name).unwrap();
+        std::fs::write(path.join("agent.pid"), DEAD_PID.to_string()).unwrap();
+        std::fs::write(path.join("vm.lock"), b"").unwrap();
         std::fs::write(path.join("storage.raw"), b"pretend this is 200 GiB").unwrap();
         path
     }
@@ -1545,6 +1589,7 @@ mod export_scratch_tests {
     /// The whole point: space an export helper abandoned comes back, so a run of
     /// failed exports cannot quietly consume the host's free space.
     #[test]
+    #[cfg(unix)]
     fn scratch_from_a_dead_helper_is_reclaimed() {
         let root = tempfile::tempdir().unwrap();
         let dead = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
@@ -1557,7 +1602,7 @@ mod export_scratch_tests {
     /// A running export owns its scratch; reaping it mid-export would pull the
     /// disks out from under a helper that is still reading them.
     #[test]
-    fn scratch_from_a_live_helper_is_left_alone() {
+    fn scratch_from_a_live_creator_is_left_alone() {
         let root = tempfile::tempdir().unwrap();
         let live = scratch(
             root.path(),
@@ -1568,6 +1613,88 @@ mod export_scratch_tests {
         reap_stale_export_scratch_in(root.path());
 
         assert!(live.exists(), "reaped a live export helper's scratch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surviving_helper_retains_scratch_until_it_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
+        let mut helper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.join("agent.pid"), format!("{}\n0\n", helper.id())).unwrap();
+        reap_stale_export_scratch_in(root.path());
+        let retained = dir.join("storage.raw").exists();
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+        assert!(
+            retained,
+            "creator exited but the helper still held its disks"
+        );
+        reap_stale_export_scratch_in(root.path());
+        assert!(!dir.exists(), "dead helper scratch was not reclaimed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_is_retained_while_launch_lock_is_held() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
+        let lock = std::fs::File::open(dir.join("vm.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        reap_stale_export_scratch_in(root.path());
+        assert!(dir.exists());
+        drop(lock);
+        reap_stale_export_scratch_in(root.path());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn missing_or_invalid_helper_identity_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        for (index, contents) in [None, Some(""), Some("invalid"), Some("0"), Some("-1")]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = scratch(
+                root.path(),
+                &index.to_string(),
+                &format!("pack-fromvm-{DEAD_PID}-17"),
+            );
+            match contents {
+                Some(text) => std::fs::write(dir.join("agent.pid"), text).unwrap(),
+                None => std::fs::remove_file(dir.join("agent.pid")).unwrap(),
+            }
+            reap_stale_export_scratch_in(root.path());
+            assert!(dir.exists());
+        }
+    }
+
+    #[test]
+    fn unmarked_prefix_lookalike_is_not_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
+        std::fs::remove_file(dir.join(super::EXPORT_SCRATCH_MARKER)).unwrap();
+        reap_stale_export_scratch_in(root.path());
+        assert!(dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_directory_symlinks_are_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dir = scratch(outside.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
+        std::os::unix::fs::symlink(&dir, root.path().join("linked")).unwrap();
+        reap_stale_export_scratch_in(root.path());
+        assert!(dir.join("storage.raw").exists());
+        assert!(root.path().join("linked").symlink_metadata().is_ok());
     }
 
     /// Everything else in this directory is a real machine. Only the export
