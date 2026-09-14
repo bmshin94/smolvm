@@ -402,7 +402,9 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(middleware::from_fn(trace_id_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
+        }))
         .layer(cors)
         .with_state(state)
 }
@@ -478,7 +480,9 @@ pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> R
         .route("/capacity", get(handlers::node::capacity))
         .route("/metrics", get(serve_metrics))
         .layer(middleware::from_fn(trace_id_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
+        }))
         .layer(cors)
         .with_state(state)
 }
