@@ -1620,13 +1620,15 @@ pub fn extract_sidecar_shared(
     debug: bool,
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
+    let was_extracted = is_extracted(&shared_dir);
     // cap_cache=false: never perform blind automatic LRU eviction here. Shared
     // entries are maintained explicitly by `smolvm pack prune`, which treats
     // each machine's `.pack-shared` pointer as a durable lease and therefore
     // cannot delete a pack mounted by a running or stopped VM.
     extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
     let overlap = cfg!(target_os = "linux")
-        && std::env::var_os("SMOLVM_CHECKPOINT_WRITEBACK").is_some()
+        && !was_extracted
+        && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
         && crate::packer::read_manifest_from_sidecar(sidecar_path)
             .is_ok_and(|m| m.checkpoint.is_some());
     if overlap {

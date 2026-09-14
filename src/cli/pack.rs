@@ -123,6 +123,7 @@ impl CheckpointCmd {
             &name,
             &self.output,
             &smolvm::portable_checkpoint::CaptureOptions {
+                prepared_cache_budget_bytes: None,
                 store_dir: self.store.clone(),
                 staging_dir: self.staging_dir,
                 lib_dir: self.lib_dir,

@@ -187,19 +187,11 @@ pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instan
     *started = std::time::Instant::now();
 }
 
-pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
-    tracing::info!(
-        machine = name,
-        phase,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "checkpoint phase completed"
-    );
-    *started = std::time::Instant::now();
-}
-
 /// Optional host paths used while building a portable checkpoint artifact.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureOptions {
+    /// Maximum unreferenced prepared-checkpoint bytes to retain on this node.
+    pub prepared_cache_budget_bytes: Option<u64>,
     /// Reuse content-addressed objects in this directory and publish a
     /// self-contained checkpoint directory instead of a compressed file.
     pub store_dir: Option<PathBuf>,
@@ -916,12 +908,19 @@ pub fn capture_to_path(
         .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
     log_phase(name, "capture_pack", &mut phase);
     #[cfg(target_os = "linux")]
-    if std::env::var_os("SMOLVM_RETAIN_PREPARED_CHECKPOINT").is_some()
+    if options
+        .prepared_cache_budget_bytes
+        .is_some_and(|bytes| bytes > 0)
         && smolvm_pack::extract::shared_extract_enabled()
     {
         if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint(output, &staging_dir)
         {
             tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+        }
+        if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(
+            options.prepared_cache_budget_bytes.unwrap_or(0),
+        ) {
+            tracing::warn!(%error, "could not prune prepared checkpoints");
         }
         log_phase(name, "capture_retain_prepared", &mut phase);
     }

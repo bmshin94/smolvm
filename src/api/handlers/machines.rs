@@ -333,16 +333,18 @@ fn take_checkpoint_cache_entry(
         }
         return false;
     }
-    // Touch so eviction sees this entry as recently used.
+    // Record use without changing the content fingerprint's modification time.
     let _ = std::fs::File::options()
         .append(true)
         .open(src)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        .and_then(|f| {
+            f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
+        });
     tracing::info!(key, "restored checkpoint from the node-local cache");
     true
 }
 
-/// Drop oldest-modified entries until the directory's total is under `max`.
+/// Drop oldest-used entries until the directory's total is under `max`.
 fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -356,7 +358,7 @@ fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
             let meta = e.metadata().ok()?;
             meta.is_file().then(|| {
                 (
-                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    meta.accessed().unwrap_or(std::time::UNIX_EPOCH),
                     meta.len(),
                     e.path(),
                 )
@@ -433,18 +435,33 @@ pub async fn capture_portable_checkpoint(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
 
-    let transfer = tempfile::Builder::new()
-        .prefix("checkpoint-transfer-")
+    let mut transfer_builder = tempfile::Builder::new();
+    transfer_builder.prefix("checkpoint-transfer-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        transfer_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let transfer = transfer_builder
         .tempdir_in(checkpoint_transfer_root()?)
         .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
     let artifact = transfer.path().join(format!("{name}.smolcheckpoint"));
     let capture_name = name.clone();
     let capture_path = artifact.clone();
+    let prepared_cache_budget_bytes = capture_options.cache_key.as_ref().map(|_| {
+        std::env::var("SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(8 * 1024 * 1024 * 1024)
+    });
     let result = tokio::task::spawn_blocking(move || {
         crate::portable_checkpoint::capture_to_path(
             &capture_name,
             &capture_path,
-            &crate::portable_checkpoint::CaptureOptions::default(),
+            &crate::portable_checkpoint::CaptureOptions {
+                prepared_cache_budget_bytes,
+                ..Default::default()
+            },
         )
     })
     .await
@@ -648,6 +665,39 @@ mod checkpoint_cache_tests {
     }
 
     #[test]
+    fn cache_hit_preserves_artifact_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let upload = dir.path().join("upload");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://cache-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&cached)
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        std::fs::File::options()
+            .write(true)
+            .open(&cached)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let before = std::fs::metadata(&cached).unwrap().modified().unwrap();
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload));
+        assert_eq!(
+            std::fs::metadata(&cached).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(&upload).unwrap().modified().unwrap(),
+            before
+        );
+    }
+
+    #[test]
     fn publication_replaces_old_entry_without_changing_active_reader() {
         let dir = tempfile::tempdir().unwrap();
         let cached = dir.path().join("cached");
@@ -705,7 +755,7 @@ mod checkpoint_cache_tests {
                 .append(true)
                 .open(&p)
                 .unwrap()
-                .set_modified(t)
+                .set_times(std::fs::FileTimes::new().set_accessed(t))
                 .unwrap();
             p
         };
@@ -904,15 +954,37 @@ pub async fn restore_portable_checkpoint(
         ));
     }
 
+    // Prepared state is an optional optimization: eviction or missing metadata
+    // falls back to the durable artifact before machine creation starts.
+    #[cfg(target_os = "linux")]
+    let prepared = if cache_hit && smolvm_pack::extract::shared_extract_enabled() {
+        let artifact = artifact.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::artifact_cache::open_prepared_checkpoint_for_sidecar(&artifact).ok()
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("prepared checkpoint task: {error}")))?
+    } else {
+        None
+    };
+    let restore_path = artifact.clone();
+    #[cfg(target_os = "linux")]
+    let restore_path = prepared
+        .as_ref()
+        .map(|input| input.path.clone())
+        .unwrap_or(restore_path);
+
     let request: CreateMachineRequest = serde_json::from_value(serde_json::json!({
         "name": name,
-        "from": artifact.to_string_lossy(),
+        "from": restore_path.to_string_lossy(),
         "ports": ports,
     }))
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
     // dropped, installing owned checkpoint payloads and exact qcow chains.
     let result = create_machine(State(state), Json(request)).await;
+    #[cfg(target_os = "linux")]
+    drop(prepared);
     if result.is_ok() {
         if let Some(key) = options.cache_key {
             if let Err(error) =
