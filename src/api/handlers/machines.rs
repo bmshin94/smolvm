@@ -578,6 +578,38 @@ mod capture_transfer_tests {
         done.await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_capture_holds_source_until_staged_not_until_packaged() {
+        let root = tempfile::tempdir().unwrap();
+        let source = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = source.clone().lock_owned().await;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let request = tokio::spawn(with_owned_transfer(transfer_in(root.path()), move |_| {
+            started_tx.send(()).unwrap();
+            stage_rx.recv().unwrap();
+            drop(guard);
+            staged_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            DropSignal(finished_tx)
+        }));
+        started_rx.recv_timeout(WAIT).unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(
+            source.try_lock().is_err(),
+            "disconnect released live source early"
+        );
+        stage_tx.send(()).unwrap();
+        staged_rx.recv_timeout(WAIT).unwrap();
+        assert!(source.try_lock().is_ok(), "packaging still owns the source");
+        finish_tx.send(()).unwrap();
+        finished_rx.recv_timeout(WAIT).unwrap();
+    }
+
     /// Sends on drop, so the test can await the moment the task's result
     /// (and with it the `TempDir`) has been released.
     #[derive(Debug)]
@@ -708,7 +740,7 @@ pub async fn capture_portable_checkpoint(
     // Serialize capture with start/stop/delete/fork so the saved vCPU state and
     // cloned qcow chains describe one stable machine generation.
     let lifecycle = state.lifecycle_lock(&name);
-    let _guard = lifecycle.lock().await;
+    let guard = lifecycle.lock_owned().await;
     // Resolve through state first so an unknown name fails before allocating a
     // potentially large staging directory. The capture core revalidates the
     // machine's state and checkpoint profile at the consistency boundary.
@@ -738,13 +770,14 @@ pub async fn capture_portable_checkpoint(
     });
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
-        crate::portable_checkpoint::capture_to_path(
+        crate::portable_checkpoint::capture_to_path_with_source_release(
             &capture_name,
             &capture_path,
             &crate::portable_checkpoint::CaptureOptions {
                 prepared_cache_budget_bytes,
                 ..Default::default()
             },
+            move || drop(guard),
         )
     })
     .await?;
