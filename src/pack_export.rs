@@ -501,6 +501,40 @@ fn prepare_export_layer_mount(
     Ok(features)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod export_layer_mount_tests {
+    use super::*;
+
+    #[test]
+    fn private_layers_keep_their_existing_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let layers = source.join("local-layers");
+        std::fs::create_dir_all(&layers).unwrap();
+        let features = LaunchFeatures {
+            packed_layers_dir: Some(layers.clone()),
+            ..Default::default()
+        };
+        let features =
+            prepare_export_layer_mount(features, &source, &root.path().join("helper")).unwrap();
+        assert_eq!(features.packed_layers_dir, Some(layers));
+        assert!(features.pack_idmap_source.is_none());
+    }
+
+    #[test]
+    fn export_without_layers_does_not_acquire_a_pack_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let features = prepare_export_layer_mount(
+            LaunchFeatures::default(),
+            &root.path().join("source"),
+            &root.path().join("helper"),
+        )
+        .unwrap();
+        assert!(features.packed_layers_dir.is_none());
+        assert!(features.pack_idmap_source.is_none());
+    }
+}
+
 /// The shell the helper runs to mount the source machine's storage read-only.
 ///
 /// Built here rather than inline so a test can assert the command is
