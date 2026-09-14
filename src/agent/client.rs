@@ -274,10 +274,8 @@ fn detached_start_timeout() -> Duration {
 /// timeout to allow for protocol overhead and response transmission.
 const TIMEOUT_BUFFER_SECS: u64 = 5;
 
-/// Timeout for shutdown acknowledgment (5 seconds).
-/// sync() + ack transmission is typically <100ms, but heavy writes or
-/// large journals may take longer. If no ack within 5s, the VM has
-/// likely already torn down — safe to proceed with SIGTERM.
+/// Maximum silence between complete shutdown progress frames.
+/// A timeout is not permission to terminate a guest with unflushed storage.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
 struct ShutdownDeadlines {

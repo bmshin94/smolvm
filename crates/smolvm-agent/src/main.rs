@@ -2528,14 +2528,10 @@ fn handle_request(
             }
         }
 
-        AgentRequest::Shutdown { .. } => {
-            info!("shutdown requested");
-            // Sync filesystem before shutdown to prevent corruption
-            sync_and_unmount_storage();
-            AgentResponse::Ok {
-                data: Some(serde_json::json!({"shutdown": true})),
-            }
-        }
+        AgentRequest::Shutdown { .. } => AgentResponse::error(
+            "shutdown must use the connection-level quiescence handler",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // VM-level background exec — spawn and return PID immediately
         AgentRequest::VmExec {

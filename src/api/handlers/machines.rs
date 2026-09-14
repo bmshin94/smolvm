@@ -2779,8 +2779,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                         return false;
                     }
                 }
-                // Prefer the registered manager (holds the flock); fall back to a
-                // PID-verified signal — same path as the stop handler.
+                // Both paths require guest quiescence before verified signals.
                 entry.as_ref().map(|e| e.lock().manager.stop().is_ok()).unwrap_or_else(||
                     shutdown_machine_process(
                         &name_for_kill,
@@ -2808,7 +2807,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                     })
                     .await;
             }
-            tracing::info!(machine = %name, stopped, "drain: machine stopped");
+            tracing::info!(machine = %name, stopped, "drain: shutdown attempt finished");
             stopped
         }));
     }
