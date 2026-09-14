@@ -2009,11 +2009,10 @@ fn ensure_shared_artifact_sha256_with_identity(
         let cached_source = fs::read(&source_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ArtifactSourceIdentity>(&bytes).ok());
-        if cached_source.as_ref() == Some(&source_identity)
-            || (service_owned_artifact(sidecar_path)
-                && cached_source
-                    .as_ref()
-                    .is_some_and(|cached| cached.covers_local(&source_identity)))
+        if service_owned_artifact(sidecar_path)
+            && cached_source
+                .as_ref()
+                .is_some_and(|cached| cached.covers_local(&source_identity))
         {
             return Ok(cached_digest);
         }
@@ -3934,6 +3933,20 @@ mod tests {
         assert!(!identity.locally_produced);
         assert!(identity.inode.is_none());
         assert!(!identity.covers_local(&identity));
+    }
+
+    #[test]
+    fn an_unchanged_external_artifact_still_requires_digest_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("download");
+        fs::write(&artifact, b"downloaded bytes").unwrap();
+        ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+        // A cached digest is not proof of local production, even with an exact
+        // source fingerprint. Re-reading the bytes must catch this mismatch.
+        fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
+        assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
     }
 
     #[cfg(unix)]
