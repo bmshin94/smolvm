@@ -254,6 +254,57 @@ pub struct FsNotifyEvent {
 // Agent Protocol (OCI Operations)
 // ============================================================================
 
+fn shutdown_progress_disabled(progress: &bool) -> bool {
+    !progress
+}
+
+#[cfg(test)]
+mod shutdown_compat_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shutdown_wire_shape_is_unchanged() {
+        let wire = r#"{"method":"shutdown"}"#;
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(wire).unwrap(),
+            AgentRequest::Shutdown { progress: false }
+        ));
+        assert_eq!(
+            serde_json::to_string(&AgentRequest::Shutdown { progress: false }).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn older_agent_can_accept_opt_in_request() {
+        #[derive(Deserialize)]
+        #[serde(tag = "method", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Shutdown,
+        }
+        let wire = serde_json::to_string(&AgentRequest::Shutdown { progress: true }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
+            LegacyRequest::Shutdown
+        ));
+    }
+
+    #[test]
+    fn traced_shutdown_preserves_progress_opt_in() {
+        let envelope = Envelope::with_trace_id(
+            AgentRequest::Shutdown { progress: true },
+            Some("shutdown-test".into()),
+        );
+        let decoded: Envelope<AgentRequest> =
+            decode_message(&encode_message(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.body,
+            AgentRequest::Shutdown { progress: true }
+        ));
+        assert_eq!(decoded.trace_id.as_deref(), Some("shutdown-test"));
+    }
+}
+
 /// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -351,7 +402,11 @@ pub enum AgentRequest {
     },
 
     /// Shutdown the agent.
-    Shutdown,
+    Shutdown {
+        /// Opt into progress frames while storage is being synchronized.
+        #[serde(default, skip_serializing_if = "shutdown_progress_disabled")]
+        progress: bool,
+    },
 
     /// Export a layer as a tar archive.
     ///
@@ -740,7 +795,7 @@ impl AgentRequest {
             AgentRequest::StorageStatus => "StorageStatus".into(),
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
-            AgentRequest::Shutdown => "Shutdown".into(),
+            AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())

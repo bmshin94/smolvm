@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 mod crun;
+mod shutdown;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
 /// deferred init (the common case) or on the first request that needs storage
@@ -2191,6 +2192,22 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::Shutdown { progress } = request {
+            shutdown::respond(stream, progress, || {
+                // Serialize shutdown requests without blocking progress for a
+                // second caller waiting for the first flush to finish.
+                static FLUSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _guard = FLUSH
+                    .lock()
+                    .map_err(|_| std::io::Error::other("storage synchronization lock poisoned"))?;
+                // Prototype gate: this retains the existing sync/remount
+                // semantics; workload-writer quiescence is not established.
+                sync_and_unmount_storage();
+                Ok(())
+            })?;
+            return Ok(());
+        }
+
         // Check if this is an interactive run request
         if let AgentRequest::Run {
             interactive: true, ..
@@ -2358,7 +2375,7 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
-        | AgentRequest::Shutdown => {}
+        | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
         }
@@ -2511,7 +2528,7 @@ fn handle_request(
             }
         }
 
-        AgentRequest::Shutdown => {
+        AgentRequest::Shutdown { .. } => {
             info!("shutdown requested");
             // Sync filesystem before shutdown to prevent corruption
             sync_and_unmount_storage();

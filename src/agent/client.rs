@@ -280,6 +280,30 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// likely already torn down — safe to proceed with SIGTERM.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
+struct ShutdownDeadlines {
+    idle: Instant,
+    hard: Instant,
+    idle_timeout: Duration,
+}
+
+impl ShutdownDeadlines {
+    fn new(now: Instant, idle_timeout: Duration, maximum: Duration) -> Self {
+        Self {
+            idle: now + idle_timeout,
+            hard: now + maximum,
+            idle_timeout,
+        }
+    }
+
+    fn next(&self) -> Instant {
+        self.idle.min(self.hard)
+    }
+
+    fn progress(&mut self, now: Instant) {
+        self.idle = now + self.idle_timeout;
+    }
+}
+
 fn shutdown_io_until(
     deadline: Instant,
     mut operation: impl FnMut() -> std::io::Result<usize>,
@@ -1651,36 +1675,56 @@ impl AgentClient {
     /// may be killed before ext4 journal commits are flushed, causing layer
     /// corruption on next boot.
     pub fn shutdown(&mut self) -> Result<()> {
-        self.shutdown_with_deadline(Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS))
+        self.shutdown_with_timeouts(
+            Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
+            Duration::from_secs(120),
+        )
     }
 
+    #[cfg(test)]
     fn shutdown_with_deadline(&mut self, timeout: Duration) -> Result<()> {
+        self.shutdown_with_timeouts(timeout, timeout)
+    }
+
+    fn shutdown_with_timeouts(&mut self, idle: Duration, maximum: Duration) -> Result<()> {
         let started = Instant::now();
-        let deadline = started + timeout;
+        let mut deadlines = ShutdownDeadlines::new(started, idle, maximum);
         self.stream.as_socket().set_nonblocking(true)?;
         let result = (|| -> Result<()> {
-            let data = self.encode_traced(&AgentRequest::Shutdown)?;
+            let data = self.encode_traced(&AgentRequest::Shutdown { progress: true })?;
             let mut sent = 0;
             while sent < data.len() {
-                sent += shutdown_io_until(deadline, || self.stream.write(&data[sent..]))?;
+                sent += shutdown_io_until(deadlines.next(), || self.stream.write(&data[sent..]))?;
             }
             tracing::debug!(
                 send_ms = started.elapsed().as_millis(),
                 "shutdown request sent; waiting for acknowledgment"
             );
-            let mut header = [0; 4];
-            self.shutdown_read_until(&mut header, deadline)?;
-            let len = u32::from_be_bytes(header) as usize;
-            if len > MAX_FRAME_SIZE as usize {
-                return Err(Error::agent("shutdown ack", "response frame too large"));
-            }
-            let mut body = vec![0; len];
-            self.shutdown_read_until(&mut body, deadline)?;
-            match serde_json::from_slice::<AgentResponse>(&body)
-                .map_err(|error| Error::agent("shutdown ack", error.to_string()))?
-            {
-                AgentResponse::Ok { .. } => Ok(()),
-                _ => Err(Error::agent("shutdown ack", "unexpected acknowledgment")),
+            loop {
+                // One deadline covers the entire frame; partial bytes never
+                // prolong shutdown. Only a complete progress response does.
+                let deadline = deadlines.next();
+                let mut header = [0; 4];
+                self.shutdown_read_until(&mut header, deadline)?;
+                let len = u32::from_be_bytes(header) as usize;
+                if len > MAX_FRAME_SIZE as usize {
+                    return Err(Error::agent("shutdown ack", "response frame too large"));
+                }
+                let mut body = vec![0; len];
+                self.shutdown_read_until(&mut body, deadline)?;
+                match serde_json::from_slice::<AgentResponse>(&body)
+                    .map_err(|error| Error::agent("shutdown ack", error.to_string()))?
+                {
+                    AgentResponse::Ok { .. } => return Ok(()),
+                    AgentResponse::Progress { message, .. } => {
+                        tracing::debug!(%message, "shutdown progress");
+                        deadlines.progress(Instant::now());
+                    }
+                    AgentResponse::Error { message, .. } => {
+                        return Err(Error::agent("shutdown ack", message));
+                    }
+                    _ => return Err(Error::agent("shutdown ack", "unexpected acknowledgment")),
+                }
             }
         })();
         let reset = self.stream.as_socket().set_nonblocking(false);
@@ -3887,6 +3931,90 @@ mod stalled_body_tests {
     use super::*;
     use std::io::Write;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn shutdown_progress_extends_idle_but_not_hard_deadline() {
+        let start = Instant::now();
+        let mut d = ShutdownDeadlines::new(start, Duration::from_secs(5), Duration::from_secs(12));
+        assert_eq!(d.next(), start + Duration::from_secs(5));
+        d.progress(start + Duration::from_secs(4));
+        assert_eq!(d.next(), start + Duration::from_secs(9));
+        d.progress(start + Duration::from_secs(8));
+        assert_eq!(d.next(), start + Duration::from_secs(12));
+        d.progress(start + Duration::from_secs(11));
+        assert_eq!(d.next(), start + Duration::from_secs(12));
+    }
+
+    #[test]
+    fn shutdown_accepts_progress_then_final_ack() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            for response in [
+                AgentResponse::Progress {
+                    message: "syncing".into(),
+                    percent: None,
+                    layer: None,
+                },
+                AgentResponse::Ok {
+                    data: Some(serde_json::json!({"shutdown":true})),
+                },
+            ] {
+                let body = serde_json::to_vec(&response).unwrap();
+                peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+                peer.write_all(&body).unwrap();
+            }
+        });
+        AgentClient::from_stream(client_stream)
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_returns_flush_error() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            let body =
+                serde_json::to_vec(&AgentResponse::error("flush failed", "IO_ERROR")).unwrap();
+            peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&body).unwrap();
+        });
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown()
+            .unwrap_err();
+        assert!(error.to_string().contains("flush failed"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_progress_stream_cannot_extend_absolute_limit() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            let body = serde_json::to_vec(&AgentResponse::Progress {
+                message: "syncing".into(),
+                percent: None,
+                layer: None,
+            })
+            .unwrap();
+            let bytes = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
+            while peer.write_all(&bytes).is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown_with_timeouts(Duration::from_millis(80), Duration::from_millis(160))
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
 
     #[test]
     fn shutdown_deadline_is_not_extended_by_partial_frames() {
