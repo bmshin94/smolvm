@@ -187,16 +187,6 @@ pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instan
     *started = std::time::Instant::now();
 }
 
-pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
-    tracing::info!(
-        machine = name,
-        phase,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "checkpoint phase completed"
-    );
-    *started = std::time::Instant::now();
-}
-
 /// Optional host paths used while building a portable checkpoint artifact.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureOptions {
