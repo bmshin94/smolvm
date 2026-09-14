@@ -416,11 +416,73 @@ async fn with_owned_transfer<T: Send + 'static>(
 
 #[cfg(test)]
 mod capture_transfer_tests {
-    use super::with_owned_transfer;
+    use super::{with_owned_operation, with_owned_transfer};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn disconnected_preparation_keeps_lifecycle_until_completion() {
+        let lifecycle = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let owned = lifecycle.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, gate) = tokio::sync::oneshot::channel();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(with_owned_operation(move |reply| async move {
+            let guard = owned.lock_owned().await;
+            started.send(()).unwrap();
+            gate.await.unwrap();
+            drop(guard);
+            let _ = reply.send(Ok(()));
+            completed.send(()).unwrap();
+        }));
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(lifecycle.try_lock().is_err());
+        finish.send(()).unwrap();
+        done.await.unwrap();
+        assert!(lifecycle.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnected_queued_operation_can_skip_preparation() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let (observed, observation) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(with_owned_operation(move |reply| async move {
+            started.send(()).unwrap();
+            gate.await.unwrap();
+            observed.send(reply.is_closed()).unwrap();
+            let _ = reply.send(Ok(()));
+        }));
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        assert!(observation.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn disconnected_queued_cleanup_still_completes() {
+        let lifecycle = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lifecycle.lock().await;
+        let owned = lifecycle.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(with_owned_operation(move |reply| async move {
+            started.send(()).unwrap();
+            let _guard = owned.lock_owned().await;
+            completed.send(()).unwrap();
+            let _ = reply.send(Ok(()));
+        }));
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(guard);
+        done.await.unwrap();
+    }
 
     /// Sends on drop, so the test can await the moment the task's result
     /// (and with it the `TempDir`) has been released.
@@ -2719,6 +2781,35 @@ pub(crate) async fn fork_machine_inner(
     golden: String,
     req: ForkRequest,
 ) -> Result<MachineInfo, ApiError> {
+    // A disconnected request must not drop lifecycle guards while its blocking
+    // preparation still creates disks and registers the child. Once preparation
+    // starts, finish boot or rollback before releasing those guards.
+    with_owned_operation(move |reply| async move {
+        let outcome = fork_machine_transaction(state, golden, req, &reply).await;
+        let _ = reply.send(outcome);
+    })
+    .await
+}
+
+async fn with_owned_operation<T, F, Fut>(work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(tokio::sync::oneshot::Sender<Result<T, ApiError>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (reply, result) = tokio::sync::oneshot::channel();
+    tokio::spawn(work(reply));
+    result
+        .await
+        .map_err(|error| ApiError::internal(format!("machine lifecycle task failed: {error}")))?
+}
+
+async fn fork_machine_transaction(
+    state: Arc<ApiState>,
+    golden: String,
+    req: ForkRequest,
+    reply: &tokio::sync::oneshot::Sender<Result<MachineInfo, ApiError>>,
+) -> Result<MachineInfo, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
@@ -2801,6 +2892,15 @@ pub(crate) async fn fork_machine_inner(
     // acquired before clone, matching the fork-pool lock order.
     let lifecycle = state.lifecycle_lock(&clone);
     let _guard = lifecycle.lock().await;
+
+    // Cancellation while queued is still safe: no child has been prepared.
+    // Check under the child lock so a concurrent delete either sees no child
+    // or waits for the entire transaction, never for just its request future.
+    if reply.is_closed() {
+        return Err(ApiError::Conflict(
+            "branch request cancelled before preparation".into(),
+        ));
+    }
 
     // Phase 1: freeze + snapshot the golden, register the clone with CoW disks.
     // This is unix-socket IO + disk work, so it runs on the blocking pool. Its
@@ -3669,6 +3769,19 @@ pub async fn delete_machine(
 /// with live clones. Shared by [`delete_machine`] (once per golden, and once per
 /// clone during a cascade).
 pub(crate) async fn delete_one(
+    state: Arc<ApiState>,
+    name: String,
+) -> Result<DeleteResponse, ApiError> {
+    // A cleanup request may outlive its caller's deadline while waiting for a
+    // branch. Keep it queued, and hold its locks through the blocking teardown.
+    with_owned_operation(move |reply| async move {
+        let result = delete_one_transaction(state, name).await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn delete_one_transaction(
     state: Arc<ApiState>,
     name: String,
 ) -> Result<DeleteResponse, ApiError> {
