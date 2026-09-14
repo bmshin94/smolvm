@@ -368,6 +368,14 @@ impl ExportVm {
             uid_share_dir: Some(source_vm_dir.to_path_buf()),
             ..Default::default()
         };
+        #[cfg(target_os = "linux")]
+        let features = match prepare_export_layer_mount(features, source_vm_dir, &data_dir) {
+            Ok(features) => features,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&data_dir);
+                return Err(error);
+            }
+        };
         if let Err(e) = manager.start_with_full_config(
             Vec::new(),
             Vec::new(),
@@ -469,6 +477,28 @@ impl ExportVm {
             Err(_) => String::new(),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_export_layer_mount(
+    mut features: LaunchFeatures,
+    source_vm_dir: &Path,
+    helper_dir: &Path,
+) -> crate::Result<LaunchFeatures> {
+    let source_layers = source_vm_dir.join("pack");
+    if read_shared_pack_pointer(&source_layers).as_ref() == features.packed_layers_dir.as_ref()
+        && features.packed_layers_dir.is_some()
+    {
+        let helper_layers = helper_dir.join("pack");
+        let lease = crate::artifact_cache::copy_shared_pack_lease(&source_layers, &helper_layers)
+            .map_err(|error| Error::agent("lease export layers", error.to_string()))?
+            .ok_or_else(|| Error::agent("lease export layers", "source lease disappeared"))?;
+        // The helper drops to the source UID; root-owned shared layers must
+        // reach it through an idmapped mount, not the private cache path.
+        features.packed_layers_dir = Some(helper_layers);
+        features.pack_idmap_source = Some(lease.shared_dir);
+    }
+    Ok(features)
 }
 
 /// The shell the helper runs to mount the source machine's storage read-only.

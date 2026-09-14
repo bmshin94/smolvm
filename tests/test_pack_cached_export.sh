@@ -35,7 +35,14 @@ source_disk="$source_dir/storage.raw"
 if [[ ! -f "$source_disk" ]]; then
     source_disk="$source_dir/storage.qcow2"
 fi
-before=$(shasum -a 256 "$source_disk")
+sha256() {
+    if command -v sha256sum >/dev/null; then
+        sha256sum "$1"
+    else
+        shasum -a 256 "$1"
+    fi
+}
+before=$(sha256 "$source_disk")
 
 # The export helper disables networking. Invalid explicit proxies also make
 # accidental re-pulls fail instead of letting this test pass online.
@@ -47,7 +54,7 @@ if grep -q 'Pulling .* in export VM' "$result_dir/export.log"; then
     echo "Unexpected registry pull"
     exit 1
 fi
-after=$(shasum -a 256 "$source_disk")
+after=$(sha256 "$source_disk")
 [[ "$before" == "$after" ]] || { echo "Export changed the source disk"; exit 1; }
 "$SMOLVM" machine create --name "$restored_name" --from "$result_dir/machine.smolmachine"
 "$SMOLVM" machine start --name "$restored_name"
