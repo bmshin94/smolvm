@@ -686,40 +686,49 @@ fn export_flattened_from_local_image(
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
-    // Stage the base layer onto the helper's own disk through tar, so whiteout
-    // devices and opaque-dir xattrs survive into the overlay mount below.
-    let src = if is_dir_source {
-        "/packed_layers".to_string()
+    // An archive image's rootfs is already sitting on the source machine's
+    // storage disk, which the helper has mounted read-only. overlayfs stacks that
+    // directly — a lower is read-only by definition, and whiteout devices and
+    // opaque-dir xattrs read back from ext4 exactly as they were written.
+    //
+    // A rootfs dir arrives over virtiofs instead, which overlayfs refuses as a
+    // lower, so that source still has to be copied onto the helper's own disk.
+    // The copy is confined to that case deliberately: it is a second full-size
+    // copy of the image on a disk whose size was guessed from the source, and
+    // taking it for an archive too is what runs a large export out of space.
+    let lower = if is_dir_source {
+        println!("Staging the machine's base layer for flatten...");
+        let dst = "/storage/stage/0".to_string();
+        let stage_cmd = format!(
+            "mkdir -p '{dst}' && (cd '/packed_layers' && tar cf - .) | (cd '{dst}' && tar xf -)"
+        );
+        let (exit_code, _, stderr) = client.vm_exec(
+            vec!["sh".to_string(), "-c".to_string(), stage_cmd],
+            vec![],
+            None,
+            None,
+            None,
+        )?;
+        if exit_code != 0 {
+            return Err(Error::agent(
+                "stage local base layer",
+                format!(
+                    "staging /packed_layers failed (exit {}): {}",
+                    exit_code,
+                    String::from_utf8_lossy(&stderr)
+                ),
+            ));
+        }
+        dst
     } else {
         locate_flattened_archive_rootfs(&mut client, vm_name)?
     };
-    println!("Staging the machine's base layer for flatten...");
-    let dst = "/storage/stage/0".to_string();
-    let stage_cmd =
-        format!("mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)");
-    let (exit_code, _, stderr) = client.vm_exec(
-        vec!["sh".to_string(), "-c".to_string(), stage_cmd],
-        vec![],
-        None,
-        None,
-        None,
-    )?;
-    if exit_code != 0 {
-        return Err(Error::agent(
-            "stage local base layer",
-            format!(
-                "staging {src} failed (exit {}): {}",
-                exit_code,
-                String::from_utf8_lossy(&stderr)
-            ),
-        ));
-    }
 
     flatten_and_export(
         collector,
         &mut client,
         overlay_owner,
-        &[dst],
+        &[lower],
         include_workspace,
     )
 }
@@ -942,18 +951,16 @@ fn flatten_and_export(
     );
     // Driven agent-side rather than through `mount(8)` over VmExec: `mount(8)`
     // rejects a `lowerdir=` value past ~255 bytes, which any image with four or
-    // more layers exceeds.
-    client.flatten_layers(&stack, "/storage/flat-export.tar")?;
-
-    // Stream the flattened tar to disk (never buffered whole in memory), then
-    // content-address it. Stage in the layers dir so the final rename is
-    // atomic on the same filesystem.
+    // more layers exceeds. The merged tree streams straight to the host — never
+    // staged as an archive in the guest, never buffered whole in memory — and is
+    // content-addressed on the way past. Stage in the layers dir so the final
+    // rename is atomic on the same filesystem.
     let tmp_file = collector
         .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
         .with_file_name("flat-export.tmp");
     let total = client
-        .read_file_to_path_capped(
-            "/storage/flat-export.tar",
+        .flatten_layers_to_path(
+            &stack,
             &tmp_file,
             crate::agent::pack_export_max_total(),
             |_| {},
@@ -1010,7 +1017,6 @@ fn export_workspace_seed(
     client: &mut AgentClient,
 ) -> crate::Result<()> {
     const GUEST_WORKSPACE: &str = "/mnt/source-storage/workspace";
-    const GUEST_TAR: &str = "/storage/workspace-seed.tar";
     let listing = client
         .vm_exec(
             vec![
@@ -1028,13 +1034,12 @@ fn export_workspace_seed(
         return Ok(());
     }
     println!("Capturing /workspace...");
-    client.flatten_layers(&[GUEST_WORKSPACE.to_string()], GUEST_TAR)?;
     let tmp_file = collector
         .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
         .with_file_name("workspace-seed.tmp");
     let total = client
-        .read_file_to_path_capped(
-            GUEST_TAR,
+        .flatten_layers_to_path(
+            &[GUEST_WORKSPACE.to_string()],
             &tmp_file,
             crate::agent::pack_export_max_total(),
             |_| {},

@@ -1607,9 +1607,33 @@ impl AgentClient {
         let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
-            output: output.to_string(),
+            output: Some(output.to_string()),
         })?;
         expect_ok(resp, "flatten layers")
+    }
+
+    /// Merge `lowerdirs` (bottom -> top) and stream the result straight into
+    /// `local_path` as a tar archive.
+    ///
+    /// Same merge as [`Self::flatten_layers`], but the archive never lands on the
+    /// guest's disk. Prefer this wherever the merged tree can be large: staging
+    /// the tar guest-side needs room for a second full copy of everything being
+    /// flattened, which is what exhausts an export helper's disk on a big image.
+    pub fn flatten_layers_to_path<F: FnMut(u64)>(
+        &mut self,
+        lowerdirs: &[String],
+        local_path: &std::path::Path,
+        cap: u64,
+        on_progress: F,
+    ) -> Result<u64> {
+        // The agent sends nothing while it mounts the overlay and spawns tar, so
+        // the same widened window the staged form needs applies here too.
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
+        self.send_raw(&AgentRequest::FlattenLayers {
+            lowerdirs: lowerdirs.to_vec(),
+            output: None,
+        })?;
+        self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
     }
 
     /// Get storage status.

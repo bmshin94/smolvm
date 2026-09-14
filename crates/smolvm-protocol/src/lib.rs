@@ -380,8 +380,16 @@ pub enum AgentRequest {
         /// are dropped, so a caller may include a container overlay's upper dir
         /// without first checking whether the machine ever wrote to it.
         lowerdirs: Vec<String>,
-        /// Guest path to write the tar archive to.
-        output: String,
+        /// Guest path to write the tar archive to, or `None` to stream the
+        /// archive straight back as `DataChunk` responses.
+        ///
+        /// Streaming is what a large export wants. The flattened tar is as large
+        /// as the image it came from, so staging it in the guest means the disk
+        /// has to hold both the expanded rootfs and a second full copy of it as
+        /// an archive — the export sizes that disk by guessing, and a big enough
+        /// image runs it out of space.
+        #[serde(default)]
+        output: Option<String>,
     },
 
     /// Wait until the workload has declared a branchpoint, returning the ready
@@ -1386,6 +1394,31 @@ mod tests {
                 assert_eq!(uid, None);
                 assert_eq!(gid, None);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_layers_output_is_optional() {
+        // A client predating streaming always names a guest path to stage the
+        // archive at, and must keep deserializing.
+        let staged =
+            r#"{"method":"flatten_layers","lowerdirs":["/a","/b"],"output":"/storage/x.tar"}"#;
+        let req: AgentRequest = serde_json::from_str(staged).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { lowerdirs, output } => {
+                assert_eq!(lowerdirs, vec!["/a".to_string(), "/b".to_string()]);
+                assert_eq!(output, Some("/storage/x.tar".to_string()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Omitting it asks the agent to stream the archive back instead, which is
+        // what keeps a large export from needing room for a second full copy.
+        let streamed = r#"{"method":"flatten_layers","lowerdirs":["/a","/b"]}"#;
+        let req: AgentRequest = serde_json::from_str(streamed).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { output, .. } => assert_eq!(output, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

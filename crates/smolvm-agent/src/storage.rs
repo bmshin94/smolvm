@@ -4464,7 +4464,42 @@ fn mount_overlay_fsconfig(
     ))
 }
 
-/// Merge `lowerdirs` into `output` as a single tar archive.
+/// A merged, readable view of a stack of layers.
+///
+/// Owns the overlay mount for as long as the caller needs the merged tree and
+/// tears it down on drop. Handing back the mount rather than a finished archive
+/// is what lets a caller tar straight out of it: a flattened rootfs is as large
+/// as the image it came from, so writing the archive to the guest's own disk
+/// first needs room for a second full copy of it.
+#[derive(Debug)]
+pub struct FlattenedTree {
+    path: PathBuf,
+    /// False when a single surviving layer was used directly, in which case
+    /// there is no mount to undo and the directory belongs to someone else.
+    mounted: bool,
+}
+
+impl FlattenedTree {
+    /// The merged tree's root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FlattenedTree {
+    fn drop(&mut self) {
+        if !self.mounted {
+            return;
+        }
+        // Best-effort: a failed unmount must not mask the caller's own error.
+        let _ = std::process::Command::new("umount")
+            .arg(&self.path)
+            .status();
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Merge `lowerdirs` into a single readable tree.
 ///
 /// Backs [`AgentRequest::FlattenLayers`](smolvm_protocol::AgentRequest::FlattenLayers).
 /// The merge is a read-only overlay mount so that whiteouts and opaque markers
@@ -4480,37 +4515,40 @@ fn mount_overlay_fsconfig(
 /// Entries that are missing or empty are dropped: callers pass a container
 /// overlay's upper dir without knowing whether the machine ever wrote to it, and
 /// overlayfs rejects a lowerdir that does not exist. A single surviving directory
-/// is tarred directly, since overlayfs requires two lower layers when there is no
+/// is used directly, since overlayfs requires two lower layers when there is no
 /// upperdir.
-pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+pub fn flatten_layers(lowerdirs: &[String]) -> Result<FlattenedTree> {
     let present = unique_lowerdirs(&mountable_lowerdirs(lowerdirs));
 
-    let source = match present.len() {
-        0 => {
-            return Err(StorageError::new(
-                "no layers to flatten: every directory was missing or empty".to_string(),
-            ))
-        }
+    match present.len() {
+        0 => Err(StorageError::new(
+            "no layers to flatten: every directory was missing or empty".to_string(),
+        )),
         // One layer needs no merge, and overlayfs would refuse it anyway.
-        1 => PathBuf::from(&present[0]),
+        1 => Ok(FlattenedTree {
+            path: PathBuf::from(&present[0]),
+            mounted: false,
+        }),
         _ => {
             let merged = Path::new(STORAGE_ROOT).join("flatten-merged");
             let _ = std::fs::remove_dir_all(&merged);
             std::fs::create_dir_all(&merged)?;
             mount_overlay_lowers_only(&present, &merged)?;
-            merged
+            Ok(FlattenedTree {
+                path: merged,
+                mounted: true,
+            })
         }
-    };
-
-    let tar_result = tar_directory(&source, output);
-
-    if source != Path::new(&present[0]) {
-        // Best-effort: a failed unmount must not mask a tar error.
-        let _ = std::process::Command::new("umount").arg(&source).status();
-        let _ = std::fs::remove_dir_all(&source);
     }
+}
 
-    tar_result
+/// Merge `lowerdirs` into `output` as a single tar archive.
+///
+/// The staged form of [`flatten_layers`], for callers that want the archive as a
+/// file in the guest rather than streamed out of it.
+pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+    let tree = flatten_layers(lowerdirs)?;
+    tar_directory(tree.path(), output)
 }
 
 /// Keep the entries of `lowerdirs` that overlayfs can actually stack.
@@ -5123,6 +5161,42 @@ mod tests {
         // Incompatible arch is rejected
         let err = ensure_archive_arch_compatible(other_arch).unwrap_err();
         assert!(err.to_string().contains("is built for architecture"));
+    }
+
+    /// A lone layer is handed back as-is rather than mounted, so dropping the
+    /// tree must leave it alone — the path belongs to the caller, and the
+    /// teardown that follows a real merge would delete the machine's own layer.
+    #[test]
+    fn flattening_a_lone_layer_does_not_consume_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("rootfs");
+        std::fs::create_dir_all(only.join("usr")).unwrap();
+
+        let path = {
+            let tree = flatten_layers(&[only.to_string_lossy().into_owned()]).unwrap();
+            assert_eq!(tree.path(), only.as_path());
+            tree.path().to_path_buf()
+        };
+
+        assert!(path.exists(), "dropping the tree deleted the source layer");
+        assert!(path.join("usr").exists());
+    }
+
+    /// Nothing mountable is an error rather than an empty archive: a silently
+    /// empty flatten would pack a machine as though it had no filesystem.
+    #[test]
+    fn flattening_nothing_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let missing = dir.path().join("missing");
+
+        let err = flatten_layers(&[
+            empty.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("no layers to flatten"));
     }
 
     /// One empty layer is a legal OCI layer (metadata or whiteouts only), so

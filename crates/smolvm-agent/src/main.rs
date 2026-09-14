@@ -2269,6 +2269,15 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::FlattenLayers {
+            ref lowerdirs,
+            output: None,
+        } = request
+        {
+            handle_streaming_flatten_layers(stream, lowerdirs)?;
+            continue;
+        }
+
         // Streaming file upload: Begin opens a session, Chunk appends
         // or finalizes. Any other request type closes the session
         // implicitly (Drop runs on the Option assignment to None).
@@ -2446,9 +2455,15 @@ fn handle_request(
                 std::time::Duration::from_millis(timeout_ms),
             ))
         }
-        AgentRequest::FlattenLayers { lowerdirs, output } => {
-            handle_flatten_layers(&lowerdirs, &output)
-        }
+        AgentRequest::FlattenLayers { lowerdirs, output } => match output {
+            Some(output) => handle_flatten_layers(&lowerdirs, &output),
+            // Streaming goes through `handle_connection`'s explicit dispatch so
+            // it can emit multiple responses per request.
+            None => AgentResponse::error(
+                "streaming flatten must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            ),
+        },
 
         AgentRequest::NetworkTest { url } => {
             info!(url = %url, "testing network connectivity directly from agent");
@@ -6537,6 +6552,96 @@ fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
     match storage::flatten_layers_to_tar(lowerdirs, std::path::Path::new(output)) {
         Ok(_) => AgentResponse::ok(None),
         Err(e) => AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+    }
+}
+
+/// Merge `lowerdirs` and stream the result back as a tar archive.
+///
+/// The same overlay merge [`handle_flatten_layers`] does, piped straight to the
+/// caller instead of landing on the guest's disk first. `pack create --from-vm`
+/// flattens a whole rootfs, so the staged form needs the export helper's disk to
+/// hold that rootfs *and* a second full copy of it as an archive; a large enough
+/// image runs the helper out of space partway through. Streaming keeps the
+/// archive off the disk entirely, so only the source rootfs has to fit.
+fn handle_streaming_flatten_layers(
+    stream: &mut impl Write,
+    lowerdirs: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        layer_count = lowerdirs.len(),
+        "flattening layers (streamed)"
+    );
+
+    // Held for the whole stream: dropping the guard unmounts the merged view, so
+    // it has to outlive the tar that reads through it.
+    let tree = match storage::flatten_layers(lowerdirs) {
+        Ok(tree) => tree,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(tree.path())
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to start flatten archive: {error}"),
+                    error_codes::EXPORT_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut stdout = child.stdout.take().expect("piped tar stdout");
+    // Body-only, so tar's exit status is checked before the stream is declared
+    // clean: a tar that dies midway must not look like a complete archive.
+    let result = send_data_chunks_body(
+        stream,
+        &mut stdout,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read flatten archive",
+        error_codes::EXPORT_FAILED,
+    );
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result?;
+    match child.wait() {
+        Ok(status) if status.success() => send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        ),
+        Ok(status) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("flatten archive exited with {status}"),
+                error_codes::EXPORT_FAILED,
+            ),
+        ),
+        Err(error) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("failed to wait for flatten archive: {error}"),
+                error_codes::EXPORT_FAILED,
+            ),
+        ),
     }
 }
 
