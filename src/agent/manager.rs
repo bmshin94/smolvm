@@ -2824,6 +2824,12 @@ impl AgentManager {
     /// and there's no state to preserve. Much faster than `stop()` which
     /// attempts a graceful vsock shutdown + SIGTERM + poll.
     pub fn kill(&self) {
+        self.kill_and_wait(std::time::Duration::from_millis(50));
+    }
+
+    /// Kill the VM and wait up to `timeout` before reclaiming its resources.
+    /// Large disposable helpers can take longer to release their mappings.
+    pub fn kill_and_wait(&self, timeout: std::time::Duration) {
         // Two PID sources with very different PID-reuse risk:
         //   - the in-memory child: a direct child we still own, so the kernel
         //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
@@ -2876,8 +2882,12 @@ impl AgentManager {
             // Brief wait for the kernel to reap (SIGKILL is near-instant).
             // try_wait reaps zombie children; is_alive catches non-children
             // that have been reparented to init/launchd.
-            for _ in 0..10 {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
                 if process::try_wait(pid).is_some() || !process::is_alive(pid) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));

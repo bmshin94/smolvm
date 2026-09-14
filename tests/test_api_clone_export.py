@@ -59,11 +59,18 @@ def main():
                 return hashlib.file_digest(stream, "sha256").hexdigest()
 
         before = digest()
+        uid_cache = disk.parent / ".vm-uid"
+        uid_before = uid_cache.read_bytes() if uid_cache.exists() else None
+        helpers_before = set(disk.parent.parent.glob("*/export-source.qcow2"))
         with tempfile.TemporaryDirectory(prefix="clone-export-") as directory:
             output = directory + "/child"
             subprocess.run([binary, "pack", "create", "--from-vm", child,
                 "--include-workspace", "-o", output], check=True, timeout=600)
             assert digest() == before, "export changed the source disk"
+            assert (uid_cache.read_bytes() if uid_cache.exists() else None) == uid_before, \
+                "export changed the source UID allocation"
+            assert set(disk.parent.parent.glob("*/export-source.qcow2")) == helpers_before, \
+                "export left a scratch disk behind"
             call("POST", "", {"name": restored, "from": output + ".smolmachine", "network": True})
             call("POST", "/" + restored + "/start")
             assert execute(restored, "test ! -e /root/delete-in-child; "

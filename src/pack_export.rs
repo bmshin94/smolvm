@@ -430,7 +430,8 @@ impl Drop for ExportVm {
         // Only scratch disks are writable, and the exported bytes are already
         // on the host. Flushing this disposable filesystem before deleting it
         // can exceed the shutdown deadline after a large export.
-        self.manager.kill();
+        self.manager
+            .kill_and_wait(std::time::Duration::from_secs(5));
         if self.manager.is_process_alive() {
             warn!(path = %self.data_dir.display(), "export helper still alive; retaining scratch disks for cleanup");
             return;
