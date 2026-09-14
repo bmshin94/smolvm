@@ -312,6 +312,10 @@ impl ExportVm {
                 ),
             ));
         }
+        // Before allocating another full-size scratch disk, take back the space
+        // any abandoned one is still holding.
+        reap_stale_export_scratch();
+
         let scratch_name = format!(
             "pack-fromvm-{}-{}",
             std::process::id(),
@@ -327,8 +331,8 @@ impl ExportVm {
         // and the agent died, surfacing as a bare "connection closed" with
         // nothing naming the disk. These disks are sparse, so a generous
         // virtual size costs nothing on the host until it is actually written.
-        let source_apparent_gib = std::fs::metadata(&storage_disk)
-            .map(|m| m.len().div_ceil(1024 * 1024 * 1024))
+        let source_apparent_gib = disk_virtual_size(&storage_disk, storage_fmt)
+            .map(|bytes| bytes.div_ceil(1024 * 1024 * 1024))
             .unwrap_or(0);
         let helper_storage_gib = source_apparent_gib
             .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
@@ -403,8 +407,10 @@ impl ExportVm {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "mkdir -p /mnt/source-storage && mount -o ro /dev/vdc /mnt/source-storage"
-                    .to_string(),
+                format!(
+                    "mkdir -p /mnt/source-storage && mount -o ro {SOURCE_DISK_DEVICE} \
+                     /mnt/source-storage"
+                ),
             ],
             vec![],
             None,
@@ -415,13 +421,127 @@ impl ExportVm {
             return Err(Error::agent(
                 "mount source storage in temp VM",
                 format!(
-                    "mount failed (exit {}): {}",
+                    "mount failed (exit {}): {}{}",
                     exit_code,
-                    String::from_utf8_lossy(&stderr)
+                    String::from_utf8_lossy(&stderr),
+                    self.describe_source_device(client),
                 ),
             ));
         }
         Ok(())
+    }
+
+    /// What the helper actually sees, appended to a mount failure.
+    ///
+    /// The source disk is attached at a fixed device name, so `mount` failing
+    /// says nothing about which of the possible causes it was: no device, the
+    /// wrong device, a device with no filesystem on it, or a host that ran out
+    /// of room to back it. Reporting the block devices, their sizes, whether an
+    /// ext4 superblock is actually present, and the helper's free space means
+    /// the next occurrence arrives already diagnosed instead of needing the
+    /// machine that produced it.
+    fn describe_source_device(&self, client: &mut AgentClient) -> String {
+        // ext4 writes magic 0xEF53 little-endian at byte 1080 (superblock at
+        // 1024, magic at offset 56), so those two bytes separate "not a
+        // filesystem" from "a filesystem this kernel would not mount".
+        let probe = format!(
+            "echo '- block devices:'; ls -l /dev/vd* 2>&1; \
+             echo '- sizes (512-byte sectors):'; \
+             for d in /sys/block/vd*; do echo \"  $(basename \"$d\") $(cat \"$d/size\" 2>/dev/null)\"; done; \
+             echo '- blkid {dev}:'; blkid {dev} 2>&1; \
+             echo '- ext4 magic at byte 1080 (expect ef53):'; \
+             dd if={dev} bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 2>&1; \
+             echo '- helper free space:'; df -h /storage 2>&1",
+            dev = SOURCE_DISK_DEVICE
+        );
+        match client.vm_exec(
+            vec!["sh".to_string(), "-c".to_string(), probe],
+            vec![],
+            None,
+            None,
+            None,
+        ) {
+            Ok((_, stdout, _)) => {
+                let seen = String::from_utf8_lossy(&stdout);
+                let seen = seen.trim_end();
+                if seen.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nWhat the export helper sees:\n{seen}")
+                }
+            }
+            // The probe is a courtesy; its own failure must not replace the
+            // mount error the caller came here for.
+            Err(_) => String::new(),
+        }
+    }
+}
+
+/// Guest device the source machine's storage disk is attached at.
+///
+/// The helper is launched with its own storage and overlay disks first, so the
+/// single extra disk lands third.
+const SOURCE_DISK_DEVICE: &str = "/dev/vdc";
+
+/// The virtual size of a disk image, whatever its on-disk format.
+///
+/// A raw disk's apparent length *is* its virtual size, but a qcow2's is the size
+/// of the container: a fresh copy-on-write overlay is a few hundred KiB however
+/// large the disk it presents. Measuring a clone's disk with plain file length
+/// therefore hands the export helper the minimum size instead of room for the
+/// filesystem it is about to read, which is its own way of running out of space.
+fn disk_virtual_size(path: &Path, format: DiskFormat) -> Option<u64> {
+    match format {
+        DiskFormat::Raw => std::fs::metadata(path).ok().map(|m| m.len()),
+        DiskFormat::Qcow2 => read_qcow2_virtual_size(path).ok(),
+    }
+}
+
+/// Remove scratch directories left behind by export helpers that are gone.
+///
+/// A helper that outlives its shutdown deadline keeps its disks so they can be
+/// cleaned up by hand, but nothing ever came back for them. Each one is as large
+/// as the export that failed, so a few failed exports in a row is enough to take
+/// a host's free space with them — and the next export then fails for lack of
+/// space rather than for its own reason. The directory's name carries the pid
+/// that created it, so one whose creator is gone is unambiguously finished.
+fn reap_stale_export_scratch() {
+    reap_stale_export_scratch_in(&crate::agent::vm_cache_root());
+}
+
+/// Lower-level form of [`reap_stale_export_scratch`] that operates on an
+/// explicit directory. Factored out for testability — callers in production
+/// should use [`reap_stale_export_scratch`].
+fn reap_stale_export_scratch_in(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
+            continue;
+        };
+        let Some(pid) = name
+            .trim_end()
+            .strip_prefix("pack-fromvm-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<crate::process::Pid>().ok())
+        else {
+            continue;
+        };
+        if crate::process::is_alive(pid) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::debug!(
+                path = %dir.display(), pid,
+                "reclaimed an abandoned export helper's scratch disks"
+            ),
+            Err(error) => tracing::debug!(
+                path = %dir.display(), %error,
+                "could not reclaim an abandoned export helper's scratch disks"
+            ),
+        }
     }
 }
 
@@ -1398,5 +1518,107 @@ mod export_helper_sizing_tests {
     #[test]
     fn an_absurd_source_size_cannot_overflow_the_multiply() {
         assert_eq!(helper_storage_gib(u64::MAX), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod export_scratch_tests {
+    use super::{disk_virtual_size, reap_stale_export_scratch_in};
+    use crate::storage::DiskFormat;
+
+    /// A pid far above any system's maximum, so it is reliably not running.
+    const DEAD_PID: u32 = 4_194_303;
+
+    fn scratch(root: &std::path::Path, dir: &str, name: &str) -> std::path::PathBuf {
+        let path = root.join(dir);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("name"), name).unwrap();
+        std::fs::write(path.join("storage.raw"), b"pretend this is 200 GiB").unwrap();
+        path
+    }
+
+    /// The whole point: space an export helper abandoned comes back, so a run of
+    /// failed exports cannot quietly consume the host's free space.
+    #[test]
+    fn scratch_from_a_dead_helper_is_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let dead = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
+
+        reap_stale_export_scratch_in(root.path());
+
+        assert!(!dead.exists(), "abandoned scratch was left on the host");
+    }
+
+    /// A running export owns its scratch; reaping it mid-export would pull the
+    /// disks out from under a helper that is still reading them.
+    #[test]
+    fn scratch_from_a_live_helper_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let live = scratch(
+            root.path(),
+            "a",
+            &format!("pack-fromvm-{}-17", std::process::id()),
+        );
+
+        reap_stale_export_scratch_in(root.path());
+
+        assert!(live.exists(), "reaped a live export helper's scratch");
+    }
+
+    /// Everything else in this directory is a real machine. Only the export
+    /// helper's own naming may be treated as disposable.
+    #[test]
+    fn real_machines_are_never_reaped() {
+        let root = tempfile::tempdir().unwrap();
+        let machine = scratch(root.path(), "a", "my-important-machine");
+        let lookalike = scratch(root.path(), "b", "pack-fromvm-not-a-pid");
+        let unnamed = root.path().join("c");
+        std::fs::create_dir_all(&unnamed).unwrap();
+
+        reap_stale_export_scratch_in(root.path());
+
+        assert!(machine.exists(), "deleted a real machine");
+        assert!(
+            lookalike.exists(),
+            "deleted a directory with no parseable pid"
+        );
+        assert!(unnamed.exists(), "deleted a directory with no name file");
+    }
+
+    /// A raw disk is sparse, so its apparent length is the size the guest sees.
+    #[test]
+    fn a_raw_disk_measures_its_apparent_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("storage.raw");
+        let file = std::fs::File::create(&raw).unwrap();
+        file.set_len(64 * 1024 * 1024 * 1024).unwrap();
+
+        assert_eq!(
+            disk_virtual_size(&raw, DiskFormat::Raw),
+            Some(64 * 1024 * 1024 * 1024)
+        );
+    }
+
+    /// The clone case: a copy-on-write overlay is tiny on disk but presents the
+    /// whole backing disk, and sizing the helper from its file length is what
+    /// used to hand a large clone the minimum.
+    #[test]
+    fn a_qcow2_measures_what_it_presents_not_what_it_occupies() {
+        let dir = tempfile::tempdir().unwrap();
+        let qcow2 = dir.path().join("storage.qcow2");
+        let virtual_size: u64 = 220 * 1024 * 1024 * 1024;
+
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(b"QFI\xfb");
+        header[4..8].copy_from_slice(&3u32.to_be_bytes());
+        header[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        std::fs::write(&qcow2, header).unwrap();
+
+        let occupies = std::fs::metadata(&qcow2).unwrap().len();
+        assert!(occupies < 1024, "fixture should be a tiny file");
+        assert_eq!(
+            disk_virtual_size(&qcow2, DiskFormat::Qcow2),
+            Some(virtual_size)
+        );
     }
 }
