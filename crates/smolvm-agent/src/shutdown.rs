@@ -50,7 +50,10 @@ fn respond_with_interval(
         }
     });
     let response = match result {
-        Ok(()) => AgentResponse::ok(Some(serde_json::json!({"shutdown": true}))),
+        Ok(()) => AgentResponse::ok(Some(serde_json::json!({
+            "shutdown": true,
+            "filesystems_quiesced": progress,
+        }))),
         Err(error) => AgentResponse::error(error.to_string(), error_codes::INTERNAL_ERROR),
     };
     super::send_response(stream, &response)
@@ -78,6 +81,12 @@ mod tests {
         assert!(matches!(
             frames(&out).as_slice(),
             [AgentResponse::Ok { .. }]
+        ));
+        let decoded = frames(&out);
+        assert!(matches!(
+            &decoded[0],
+            AgentResponse::Ok { data: Some(data) }
+                if data["filesystems_quiesced"] == false
         ));
     }
 
@@ -154,5 +163,10 @@ mod tests {
             Some(AgentResponse::Progress { .. })
         ));
         assert!(matches!(decoded.last(), Some(AgentResponse::Ok { .. })));
+        assert!(matches!(
+            decoded.last(),
+            Some(AgentResponse::Ok { data: Some(data) })
+                if data["filesystems_quiesced"] == true
+        ));
     }
 }

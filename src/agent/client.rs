@@ -1715,7 +1715,21 @@ impl AgentClient {
                 match serde_json::from_slice::<AgentResponse>(&body)
                     .map_err(|error| Error::agent("shutdown ack", error.to_string()))?
                 {
-                    AgentResponse::Ok { .. } => return Ok(()),
+                    AgentResponse::Ok { data }
+                        if data
+                            .as_ref()
+                            .and_then(|value| value.get("filesystems_quiesced"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true) =>
+                    {
+                        return Ok(())
+                    }
+                    AgentResponse::Ok { .. } => {
+                        return Err(Error::agent(
+                            "shutdown ack",
+                            "guest did not confirm that its filesystems were quiesced",
+                        ));
+                    }
                     AgentResponse::Progress { message, .. } => {
                         tracing::debug!(%message, "shutdown progress");
                         deadlines.progress(Instant::now());
@@ -3958,7 +3972,10 @@ mod stalled_body_tests {
                     layer: None,
                 },
                 AgentResponse::Ok {
-                    data: Some(serde_json::json!({"shutdown":true})),
+                    data: Some(serde_json::json!({
+                        "shutdown": true,
+                        "filesystems_quiesced": true,
+                    })),
                 },
             ] {
                 let body = serde_json::to_vec(&response).unwrap();
@@ -3969,6 +3986,26 @@ mod stalled_body_tests {
         AgentClient::from_stream(client_stream)
             .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
             .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_rejects_legacy_ack_without_quiesce_confirmation() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            let response = AgentResponse::Ok {
+                data: Some(serde_json::json!({"shutdown": true})),
+            };
+            let body = serde_json::to_vec(&response).unwrap();
+            peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&body).unwrap();
+        });
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("filesystems were quiesced"));
         server.join().unwrap();
     }
 
