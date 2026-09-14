@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 mod crun;
 mod shutdown;
+mod shutdown_freeze;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
 /// deferred init (the common case) or on the first request that needs storage
@@ -2200,10 +2201,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                 let _guard = FLUSH
                     .lock()
                     .map_err(|_| std::io::Error::other("storage synchronization lock poisoned"))?;
-                // Prototype gate: this retains the existing sync/remount
-                // semantics; workload-writer quiescence is not established.
-                sync_and_unmount_storage();
-                Ok(())
+                if progress {
+                    shutdown_freeze::freeze_internal_filesystems()
+                } else {
+                    // Legacy clients retain the existing shutdown contract.
+                    sync_and_unmount_storage();
+                    Ok(())
+                }
             })?;
             return Ok(());
         }
