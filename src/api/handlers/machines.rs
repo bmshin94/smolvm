@@ -352,6 +352,7 @@ fn take_checkpoint_cache_entry(
     if !src.is_file() {
         return None;
     }
+    let link_started = std::time::Instant::now();
     let linked = (|| -> std::io::Result<()> {
         let parent = src
             .parent()
@@ -363,11 +364,18 @@ fn take_checkpoint_cache_entry(
         tracing::warn!(key, error = %error, "cached checkpoint present but could not be linked");
         return None;
     }
+    let link_ms = link_started.elapsed().as_millis() as u64;
+    let verification_started = std::time::Instant::now();
     // The cache-link operation already recorded access and refreshed any local
     // provenance before verification captures its final inode identity.
     match crate::portable_checkpoint::verify_sidecar_pinned(artifact) {
         Ok(verified) => {
-            tracing::info!(key, "restored checkpoint from the node-local cache");
+            tracing::info!(
+                key,
+                link_ms,
+                verify_ms = verification_started.elapsed().as_millis() as u64,
+                "restored checkpoint from the node-local cache"
+            );
             Some(verified)
         }
         Err(_) => {
