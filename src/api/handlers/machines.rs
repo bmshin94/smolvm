@@ -400,6 +400,132 @@ fn max_checkpoint_upload_bytes() -> u64 {
         .unwrap_or(2 * 1024 * 1024 * 1024 * 1024)
 }
 
+/// Keep staging owned by the blocking task so cancellation cannot remove it
+/// while capture is writing; return ownership only to a connected caller.
+async fn with_owned_transfer<T: Send + 'static>(
+    transfer: tempfile::TempDir,
+    work: impl FnOnce(&std::path::Path) -> T + Send + 'static,
+) -> Result<(tempfile::TempDir, T), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let out = work(transfer.path());
+        (transfer, out)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("checkpoint transfer task failed: {error}")))
+}
+
+#[cfg(test)]
+mod capture_transfer_tests {
+    use super::with_owned_transfer;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Sends on drop, so the test can await the moment the task's result
+    /// (and with it the `TempDir`) has been released.
+    #[derive(Debug)]
+    struct DropSignal(mpsc::Sender<()>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn transfer_in(root: &std::path::Path) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("checkpoint-transfer-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    /// The client disconnects mid-capture (request future aborted) while the
+    /// capture is parked; the capture then resumes, recreates its output
+    /// directory the way `pack_artifact` does, and writes the artifact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_capture_request_never_leaves_an_orphan_transfer_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let transfer = transfer_in(root.path());
+        let dir = transfer.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel();
+        let request = tokio::spawn(with_owned_transfer(transfer, move |out| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            std::fs::create_dir_all(out).unwrap();
+            std::fs::write(out.join("x.smolcheckpoint"), b"artifact").unwrap();
+            DropSignal(released_tx)
+        }));
+        started_rx.recv_timeout(WAIT).unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        // The cancelled request must not have taken the directory away from
+        // the still-running capture.
+        assert!(
+            dir.exists(),
+            "cancellation removed the directory under a running capture"
+        );
+        release_tx.send(()).unwrap();
+        released_rx.recv_timeout(WAIT).unwrap();
+        assert!(!dir.exists(), "orphan transfer directory left behind");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connected_capture_hands_the_transfer_back_to_the_caller() {
+        let root = tempfile::tempdir().unwrap();
+        let transfer = transfer_in(root.path());
+        let expected = transfer.path().to_path_buf();
+        let (kept, out) = with_owned_transfer(transfer, |dir| {
+            std::fs::write(dir.join("a.smolcheckpoint"), b"1").unwrap();
+            7
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, 7);
+        assert_eq!(kept.path(), expected);
+        assert!(expected.join("a.smolcheckpoint").exists());
+        drop(kept);
+        assert!(!expected.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_or_panicking_capture_still_reclaims_the_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        // A capture error is handed back with the directory; the handler's
+        // early return drops it.
+        let transfer = transfer_in(root.path());
+        let dir = transfer.path().to_path_buf();
+        let (kept, out) = with_owned_transfer(transfer, |dir| {
+            std::fs::write(dir.join("partial"), b"x").unwrap();
+            Err::<(), &str>("capture failed")
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, Err("capture failed"));
+        drop(kept);
+        assert!(!dir.exists());
+        // A panicking capture unwinds the task that owns the directory.
+        let transfer = transfer_in(root.path());
+        let dir = transfer.path().to_path_buf();
+        let error = with_owned_transfer::<()>(transfer, |dir| {
+            std::fs::write(dir.join("partial"), b"x").unwrap();
+            panic!("capture panicked");
+        })
+        .await
+        .err()
+        .expect("panic surfaces as an error");
+        assert!(format!("{error:?}").contains("checkpoint transfer task failed"));
+        let deadline = Instant::now() + WAIT;
+        while dir.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
+
 fn checkpoint_capture_error(error: crate::Error) -> ApiError {
     match error {
         crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
@@ -455,7 +581,8 @@ pub async fn capture_portable_checkpoint(
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(8 * 1024 * 1024 * 1024)
     });
-    let result = tokio::task::spawn_blocking(move || {
+    // Keep staging alive until the background capture finishes, even on disconnect.
+    let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
         crate::portable_checkpoint::capture_to_path(
             &capture_name,
             &capture_path,
@@ -465,9 +592,8 @@ pub async fn capture_portable_checkpoint(
             },
         )
     })
-    .await
-    .map_err(|error| ApiError::internal(format!("checkpoint capture task failed: {error}")))?
-    .map_err(checkpoint_capture_error)?;
+    .await?;
+    let result = result.map_err(checkpoint_capture_error)?;
 
     if let Some(key) = capture_options.cache_key {
         let artifact = artifact.clone();
