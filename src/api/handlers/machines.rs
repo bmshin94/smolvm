@@ -263,6 +263,16 @@ pub async fn capture_portable_checkpoint(
 pub struct RestoreCheckpointQuery {
     /// JSON port mappings for this host; guest ports must match the checkpoint.
     pub ports: Option<String>,
+    /// Pre-signed object-store URL to pull the checkpoint from, instead of the
+    /// caller streaming it in the request body.
+    ///
+    /// A live checkpoint is gigabytes. Relaying it through the control plane
+    /// costs a second full copy over the wire and pins it to the control's
+    /// throughput — measured at roughly a fifth of what the node reaches
+    /// fetching the same object itself, and the dominant term in a restore that
+    /// then boots in three seconds. The URL carries its own scoped, expiring
+    /// authorisation, so the node needs no object-store credentials of its own.
+    pub source_url: Option<String>,
 }
 
 fn checkpoint_host_ports(
@@ -282,6 +292,92 @@ fn checkpoint_host_ports(
         ));
     }
     Ok(requested.to_vec())
+}
+
+/// Object-store hosts a checkpoint may be fetched from.
+///
+/// The node is being handed a URL by its control plane and asked to retrieve it,
+/// which is a request-forgery primitive if left open: a caller that can reach
+/// this endpoint could otherwise aim it at link-local metadata, a loopback
+/// admin port, or a peer on the private network. Restricting the host to the
+/// object store — and refusing redirects at the call site — keeps the parameter
+/// to the one job it exists for.
+const CHECKPOINT_SOURCE_HOSTS: [&str; 2] = ["storage.googleapis.com", "storage.cloud.google.com"];
+
+/// Validate a checkpoint source URL, returning it only when it is an HTTPS URL
+/// pointing at [`CHECKPOINT_SOURCE_HOSTS`] (or a bucket subdomain of one).
+fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| ApiError::BadRequest(format!("invalid checkpoint source url: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(ApiError::BadRequest(
+            "checkpoint source url must be https".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::BadRequest("checkpoint source url has no host".to_string()))?;
+    let allowed = CHECKPOINT_SOURCE_HOSTS
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")));
+    if !allowed {
+        return Err(ApiError::BadRequest(format!(
+            "checkpoint source host {host} is not an allowed object store"
+        )));
+    }
+    Ok(url)
+}
+
+#[cfg(test)]
+mod checkpoint_source_tests {
+    use super::checked_checkpoint_source;
+
+    /// The node fetches whatever URL its control plane names, so the allow-list
+    /// is the only thing standing between this parameter and a request-forgery
+    /// primitive. These are the targets that matter on a cloud host.
+    #[test]
+    fn refuses_everything_outside_the_object_store() {
+        for raw in [
+            "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+            "https://169.254.169.254/computeMetadata/v1/",
+            "http://127.0.0.1:8080/api/v1/machines",
+            "https://127.0.0.1/",
+            "http://[::1]:8080/",
+            "https://10.0.0.2/",
+            "file:///etc/shadow",
+            "https://storage.googleapis.com.evil.test/o",
+            "https://evil.test/storage.googleapis.com",
+            "gopher://storage.googleapis.com/",
+        ] {
+            assert!(
+                checked_checkpoint_source(raw).is_err(),
+                "{raw} must be refused as a checkpoint source"
+            );
+        }
+    }
+
+    /// Plain HTTP is refused even for an allowed host: a signed URL in the clear
+    /// hands the bearer token to anything on the path.
+    #[test]
+    fn refuses_plaintext_even_for_an_allowed_host() {
+        assert!(checked_checkpoint_source("http://storage.googleapis.com/b/o").is_err());
+    }
+
+    /// The real shapes a signed URL arrives in: the bucket may be a subdomain or
+    /// the first path segment.
+    #[test]
+    fn accepts_signed_object_store_urls() {
+        for raw in [
+            "https://storage.googleapis.com/smolmachines-snapshots/o.smolcheckpoint?x-goog-signature=ab",
+            "https://smolmachines-snapshots.storage.googleapis.com/o.smolcheckpoint?x-goog-signature=ab",
+            "https://storage.cloud.google.com/smolmachines-snapshots/o.smolcheckpoint",
+        ] {
+            assert!(
+                checked_checkpoint_source(raw).is_ok(),
+                "{raw} is a legitimate signed checkpoint source"
+            );
+        }
+    }
 }
 
 /// Import a live checkpoint, optionally rebinding its host-side published ports.
@@ -309,21 +405,61 @@ pub async fn restore_portable_checkpoint(
         .map_err(|error| ApiError::internal(format!("create checkpoint upload: {error}")))?;
     let limit = max_checkpoint_upload_bytes();
     let mut received = 0_u64;
-    let mut body = request.into_body().into_data_stream();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk
-            .map_err(|error| ApiError::BadRequest(format!("read checkpoint upload: {error}")))?;
-        received = received
-            .checked_add(chunk.len() as u64)
-            .ok_or_else(|| ApiError::BadRequest("checkpoint upload size overflow".to_string()))?;
-        if received > limit {
+    if let Some(raw) = options.source_url.as_deref() {
+        // Pull the checkpoint ourselves. `none()` redirects: a signed URL needs
+        // no hop, and following one would let the allow-list above be escaped by
+        // a 302 to somewhere it forbids.
+        let url = checked_checkpoint_source(raw)?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                ApiError::internal(format!("build checkpoint fetch client: {error}"))
+            })?;
+        let response = client.get(url).send().await.map_err(|error| {
+            ApiError::internal(format!("fetch checkpoint from source url: {error}"))
+        })?;
+        if !response.status().is_success() {
             return Err(ApiError::BadRequest(format!(
-                "checkpoint exceeds the configured {limit}-byte upload limit"
+                "checkpoint source url returned {}",
+                response.status()
             )));
         }
-        file.write_all(&chunk)
-            .await
-            .map_err(|error| ApiError::internal(format!("write checkpoint upload: {error}")))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                ApiError::internal(format!("read checkpoint from source url: {error}"))
+            })?;
+            received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                ApiError::BadRequest("checkpoint upload size overflow".to_string())
+            })?;
+            if received > limit {
+                return Err(ApiError::BadRequest(format!(
+                    "checkpoint exceeds the configured {limit}-byte upload limit"
+                )));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| ApiError::internal(format!("write checkpoint: {error}")))?;
+        }
+    } else {
+        let mut body = request.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                ApiError::BadRequest(format!("read checkpoint upload: {error}"))
+            })?;
+            received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                ApiError::BadRequest("checkpoint upload size overflow".to_string())
+            })?;
+            if received > limit {
+                return Err(ApiError::BadRequest(format!(
+                    "checkpoint exceeds the configured {limit}-byte upload limit"
+                )));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| ApiError::internal(format!("write checkpoint upload: {error}")))?;
+        }
     }
     if received == 0 {
         return Err(ApiError::BadRequest(
