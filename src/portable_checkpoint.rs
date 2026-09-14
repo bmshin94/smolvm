@@ -35,9 +35,9 @@ const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
 const READONLY_INPUT_MARKER: &str = "readonly-memory";
 
+#[cfg(target_os = "linux")]
 fn readonly_restore_supported() -> bool {
-    if !cfg!(target_os = "linux")
-        || !crate::process::vm_uid_drop_active()
+    if !crate::process::vm_uid_drop_active()
         || std::env::var_os("SMOLVM_DISABLE_READONLY_RESTORE").is_some()
     {
         return false;
