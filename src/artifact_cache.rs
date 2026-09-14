@@ -334,6 +334,20 @@ pub fn prepared_checkpoint_reference(sidecar: &Path) -> io::Result<String> {
     Ok(format!("checkpoint://{:08x}-{digest}", footer.checksum))
 }
 
+/// Publish a cache alias while preserving verified local capture provenance.
+pub fn link_checkpoint_artifact(
+    source: &Path,
+    destination: &Path,
+    replace: bool,
+) -> io::Result<()> {
+    smolvm_pack::extract::link_checkpoint_artifact(
+        source,
+        destination,
+        &shared_pack_cache_root(),
+        replace,
+    )
+}
+
 /// Pin a node-local capture through import so pruning cannot remove its inputs.
 pub fn open_prepared_checkpoint(reference: &str) -> io::Result<PreparedCheckpoint> {
     let key = reference.strip_prefix("checkpoint://").unwrap_or("");

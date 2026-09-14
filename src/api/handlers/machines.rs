@@ -264,11 +264,8 @@ fn replace_checkpoint_cache_entry(
     let parent = destination.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent")
     })?;
-    let staging = tempfile::tempdir_in(parent)?;
-    let link = staging.path().join("artifact");
-    std::fs::hard_link(artifact, &link)?;
     let _lock = lock_checkpoint_cache_namespace(parent)?;
-    std::fs::rename(link, destination)
+    crate::artifact_cache::link_checkpoint_artifact(artifact, destination, true)
 }
 
 const CHECKPOINT_CACHE_LOCK: &str = ".checkpoint-cache.lock";
@@ -323,19 +320,19 @@ fn take_checkpoint_cache_entry(
     if !src.is_file() {
         return None;
     }
-    if let Err(error) = std::fs::hard_link(src, artifact) {
+    let linked = (|| -> std::io::Result<()> {
+        let parent = src
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache source has no parent"))?;
+        let _lock = lock_checkpoint_cache_namespace(parent)?;
+        crate::artifact_cache::link_checkpoint_artifact(src, artifact, false)
+    })();
+    if let Err(error) = linked {
         tracing::warn!(key, error = %error, "cached checkpoint present but could not be linked");
         return None;
     }
-    // Record use without changing the content fingerprint's modification time.
-    // Done before verification: the touch moves the inode's ctime, and the
-    // verification below captures the identity it will later be matched on.
-    let _ = std::fs::File::options()
-        .append(true)
-        .open(src)
-        .and_then(|f| {
-            f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
-        });
+    // The cache-link operation already recorded access and refreshed any local
+    // provenance before verification captures its final inode identity.
     match crate::portable_checkpoint::verify_sidecar_pinned(artifact) {
         Ok(verified) => {
             tracing::info!(key, "restored checkpoint from the node-local cache");

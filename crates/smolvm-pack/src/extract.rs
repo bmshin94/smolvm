@@ -1600,13 +1600,18 @@ pub fn retain_prepared_checkpoint_with_identity(
     // Consume the packer's proof before our own hard-link operation changes
     // ctime. A stale proof falls back to full verification.
     ensure_shared_artifact_sha256_with_identity(sidecar, &target, identity)?;
+    let produced_locally = fs::read(shared_artifact_source_path(&target))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ArtifactSourceIdentity>(&bytes).ok())
+        .is_some_and(|source| source.locally_produced);
     fs::hard_link(sidecar, &retained_artifact)?;
     // Capture owns both names under the cache lock; publish the post-link
     // fingerprint rather than paying another hash for our own metadata change.
+    let mut retained_identity = artifact_source_identity(&retained_artifact)?;
+    retained_identity.locally_produced = produced_locally;
     write_atomic_marker(
         &shared_artifact_source_path(&target),
-        &serde_json::to_vec(&artifact_source_identity(&retained_artifact)?)
-            .map_err(std::io::Error::other)?,
+        &serde_json::to_vec(&retained_identity).map_err(std::io::Error::other)?,
     )?;
     fs::rename(prepared, &target)?;
     File::open(shared_root)?.sync_all()?;
@@ -1696,12 +1701,60 @@ pub fn read_shared_artifact_sha256(shared_dir: &Path) -> std::io::Result<String>
     Ok(digest)
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct ArtifactSourceIdentity {
     canonical_path: String,
     len: u64,
     modified_secs: Option<u64>,
     modified_nanos: Option<u32>,
+    #[serde(default)]
+    inode: Option<(u64, u64, i64, i64)>,
+    #[serde(default)]
+    locally_produced: bool,
+}
+
+impl ArtifactSourceIdentity {
+    fn same_inode(&self, other: &Self) -> bool {
+        self.inode
+            .zip(other.inode)
+            .is_some_and(|(a, b)| a.0 == b.0 && a.1 == b.1)
+    }
+
+    fn covers_local(&self, other: &Self) -> bool {
+        self.locally_produced
+            && self.inode.is_some()
+            && self.inode == other.inode
+            && self.len == other.len
+            && self.modified_secs == other.modified_secs
+            && self.modified_nanos == other.modified_nanos
+    }
+}
+
+fn service_owned_artifact(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(file) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Ok(parent) = fs::metadata(parent) else {
+            return false;
+        };
+        file.is_file()
+            && file.uid() == 0
+            && file.mode() & 0o077 == 0
+            && parent.is_dir()
+            && parent.uid() == 0
+            && parent.mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn artifact_source_identity(sidecar_path: &Path) -> std::io::Result<ArtifactSourceIdentity> {
@@ -1716,11 +1769,112 @@ fn artifact_source_identity(sidecar_path: &Path) -> std::io::Result<ArtifactSour
         len: metadata.len(),
         modified_secs: modified.map(|duration| duration.as_secs()),
         modified_nanos: modified.map(|duration| duration.subsec_nanos()),
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            Some((
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ))
+        },
+        #[cfg(not(unix))]
+        inode: None,
+        locally_produced: false,
     })
 }
 
 fn shared_artifact_source_path(shared_dir: &Path) -> PathBuf {
     shared_dir.with_extension("artifact-source.json")
+}
+
+/// Create a service-owned cache alias and account for its metadata-only change.
+/// The caller must hold its cache namespace lock. Only an unchanged locally
+/// produced inode can carry its digest through this operation; other sources
+/// retain the ordinary full-verification path.
+pub fn link_checkpoint_artifact(
+    source: &Path,
+    destination: &Path,
+    shared_root: &Path,
+    replace: bool,
+) -> std::io::Result<()> {
+    let provenance = (|| -> std::io::Result<_> {
+        if !service_owned_artifact(source) {
+            return Err(std::io::Error::other("not a service-owned capture"));
+        }
+        let footer =
+            crate::packer::read_footer_from_sidecar(source).map_err(std::io::Error::other)?;
+        let shared = shared_pack_dir(shared_root, footer.checksum);
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(shared_artifact_sha256_path(&shared).with_extension("artifact-sha256.lock"))?;
+        lock_file_exclusive(&lock)?;
+        let before = artifact_source_identity(source)?;
+        let cached: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared))?)
+                .map_err(std::io::Error::other)?;
+        if !cached.covers_local(&before) {
+            return Err(std::io::Error::other("local capture identity changed"));
+        }
+        let pinned = File::open(source)?;
+        Ok((lock, shared, before, pinned))
+    })()
+    .ok();
+
+    if replace {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache destination has no parent"))?;
+        let staging = tempfile::tempdir_in(parent)?;
+        let link = staging.path().join("artifact");
+        fs::hard_link(source, &link)?;
+        fs::rename(&link, destination)?;
+    } else {
+        fs::hard_link(source, destination)?;
+    }
+    // Record LRU use before refreshing ctime. Neither operation changes bytes.
+    if let Ok(file) = File::open(destination) {
+        let _ = file.set_times(fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+    }
+    if let Some((_lock, shared, before, pinned)) = provenance {
+        let refresh = (|| -> std::io::Result<()> {
+            let mut after = artifact_source_identity(destination)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let pinned = pinned.metadata()?;
+                if after.inode.map(|id| (id.0, id.1)) != Some((pinned.dev(), pinned.ino())) {
+                    return Err(std::io::Error::other(
+                        "cache alias replaced during publication",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = pinned;
+            if !service_owned_artifact(destination)
+                || !before.same_inode(&after)
+                || before.len != after.len
+                || before.modified_secs != after.modified_secs
+                || before.modified_nanos != after.modified_nanos
+            {
+                return Err(std::io::Error::other(
+                    "capture changed during cache publication",
+                ));
+            }
+            after.locally_produced = true;
+            write_atomic_marker(
+                &shared_artifact_source_path(&shared),
+                &serde_json::to_vec(&after).map_err(std::io::Error::other)?,
+            )
+        })();
+        // A missed fingerprint refresh only costs a later full hash. Cache
+        // publication itself must not fail after a valid alias was installed.
+        let _ = refresh;
+    }
+    Ok(())
 }
 
 fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
@@ -1791,13 +1945,18 @@ fn ensure_shared_artifact_sha256_with_identity(
     lock_file_exclusive(&lock_file)?;
 
     let source_path = shared_artifact_source_path(shared_dir);
-    let source_identity = artifact_source_identity(sidecar_path)?;
+    let mut source_identity = artifact_source_identity(sidecar_path)?;
     if digest_path.exists() {
         let cached_digest = read_shared_artifact_sha256(shared_dir)?;
         let cached_source = fs::read(&source_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ArtifactSourceIdentity>(&bytes).ok());
-        if cached_source.as_ref() == Some(&source_identity) {
+        if cached_source.as_ref() == Some(&source_identity)
+            || (service_owned_artifact(sidecar_path)
+                && cached_source
+                    .as_ref()
+                    .is_some_and(|cached| cached.covers_local(&source_identity)))
+        {
             return Ok(cached_digest);
         }
 
@@ -1816,6 +1975,13 @@ fn ensure_shared_artifact_sha256_with_identity(
                 ),
             ));
         }
+        // A changed inode has crossed a provenance boundary, even if its
+        // bytes matched. Only the original locally produced inode keeps this
+        // property after a successful full re-verification.
+        source_identity.locally_produced = service_owned_artifact(sidecar_path)
+            && cached_source.as_ref().is_some_and(|cached| {
+                cached.locally_produced && cached.same_inode(&source_identity)
+            });
         write_atomic_marker(
             &source_path,
             &serde_json::to_vec(&source_identity)
@@ -1824,7 +1990,10 @@ fn ensure_shared_artifact_sha256_with_identity(
         return Ok(cached_digest);
     }
 
-    let digest = match identity.and_then(|identity| identity.digest_for(sidecar_path)) {
+    let written_digest = identity.and_then(|identity| identity.digest_for(sidecar_path));
+    source_identity.locally_produced =
+        written_digest.is_some() && service_owned_artifact(sidecar_path);
+    let digest = match written_digest {
         Some(digest) => digest.to_owned(),
         None => hash_artifact_sha256(sidecar_path)?,
     };
@@ -3281,6 +3450,46 @@ pub fn create_or_copy_storage_disk(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_digest_identity_ignores_only_path() {
+        let original = super::ArtifactSourceIdentity {
+            canonical_path: "capture".into(),
+            len: 1024,
+            modified_secs: Some(10),
+            modified_nanos: Some(20),
+            inode: Some((1, 2, 30, 40)),
+            locally_produced: true,
+        };
+        let mut alias = super::ArtifactSourceIdentity {
+            canonical_path: "restore".into(),
+            locally_produced: false,
+            ..original.clone()
+        };
+        assert!(original.covers_local(&alias));
+        alias.inode = Some((1, 3, 30, 40));
+        assert!(
+            !original.covers_local(&alias),
+            "copied bytes are not local provenance"
+        );
+        alias.inode = Some((1, 2, 30, 41));
+        assert!(
+            !original.covers_local(&alias),
+            "ctime changes require verification"
+        );
+        alias.inode = original.inode;
+        alias.len += 1;
+        assert!(!original.covers_local(&alias));
+        alias.len = original.len;
+        alias.modified_nanos = Some(21);
+        assert!(!original.covers_local(&alias));
+        let mut untrusted = original.clone();
+        untrusted.locally_produced = false;
+        assert!(!untrusted.covers_local(&original));
+        untrusted.locally_produced = true;
+        untrusted.inode = None;
+        assert!(!untrusted.covers_local(&untrusted));
+    }
+
     /// The macOS leniency may only skip the errors it exists for. A destination
     /// that has stopped accepting writes is not one of them: skipping it turns
     /// a failed extraction into one that reports success on a half-written tree.
@@ -3635,6 +3844,91 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("checksum collision"));
         assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_digest_rejects_same_length_edit_with_restored_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("artifact");
+        fs::write(&artifact, b"original").unwrap();
+        let digest = ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+        let modified = fs::metadata(&artifact).unwrap().modified().unwrap();
+        // Separate timestamps even on filesystems with coarse clock resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&artifact, b"modified").unwrap();
+        File::open(&artifact)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+        assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), digest);
+    }
+
+    #[test]
+    fn legacy_digest_identity_has_no_local_provenance() {
+        let identity: super::ArtifactSourceIdentity = serde_json::from_str(
+            r#"{"canonical_path":"old","len":1,"modified_secs":1,"modified_nanos":0}"#,
+        )
+        .unwrap();
+        assert!(!identity.locally_produced);
+        assert!(identity.inode.is_none());
+        assert!(!identity.covers_local(&identity));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locally_produced_digest_survives_controlled_alias_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("capture");
+        let manifest = crate::format::PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (info, proof) = crate::packer::Packer::new(manifest)
+            .pack_artifact_with_identity(&artifact)
+            .unwrap();
+        // Pack files inherit the private staging directory. Do not chmod after
+        // obtaining the proof: that would correctly invalidate its ctime.
+        let private = fs::metadata(&artifact).unwrap().permissions().mode() & 0o077 == 0;
+        let shared = shared_pack_dir(temp.path(), info.checksum);
+        fs::create_dir(&shared).unwrap();
+        let digest =
+            ensure_shared_artifact_sha256_with_identity(&artifact, &shared, Some(&proof)).unwrap();
+        let local = service_owned_artifact(&artifact);
+        let alias = temp.path().join("cache");
+        link_checkpoint_artifact(&artifact, &alias, temp.path(), true).unwrap();
+        let recorded: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                .unwrap();
+        if local {
+            assert!(private);
+            assert!(recorded.covers_local(&artifact_source_identity(&alias).unwrap()));
+        } else {
+            assert!(!recorded.locally_produced);
+        }
+        assert_eq!(
+            ensure_shared_artifact_sha256(&alias, &shared).unwrap(),
+            digest
+        );
+        let upload = temp.path().join("upload");
+        fs::copy(&alias, &upload).unwrap();
+        assert_eq!(
+            ensure_shared_artifact_sha256(&upload, &shared).unwrap(),
+            digest
+        );
+        let uploaded: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                .unwrap();
+        assert!(
+            !uploaded.locally_produced,
+            "copied bytes must not inherit provenance"
+        );
     }
 
     /// Build a single-file tar archive in memory with the given name and data.
