@@ -1748,7 +1748,7 @@ fn service_owned_artifact(path: &Path) -> bool {
             && file.mode() & 0o077 == 0
             && parent.is_dir()
             && parent.uid() == 0
-            && parent.mode() & 0o077 == 0
+            && parent.mode() & 0o022 == 0
     }
     #[cfg(not(unix))]
     {
@@ -3972,7 +3972,12 @@ mod tests {
         let digest =
             ensure_shared_artifact_sha256_with_identity(&artifact, &shared, Some(&proof)).unwrap();
         let local = service_owned_artifact(&artifact);
-        let alias = temp.path().join("cache");
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        // The API cache directory is root-owned 0755. Directory readability
+        // does not allow replacing a private 0600 artifact inside it.
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = cache.join("artifact");
         link_checkpoint_artifact(&artifact, &alias, temp.path(), true).unwrap();
         let recorded: ArtifactSourceIdentity =
             serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
