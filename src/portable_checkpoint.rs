@@ -383,9 +383,33 @@ pub struct VerifiedSidecar {
     identity: SidecarIdentity,
 }
 
+pub(crate) enum SidecarVerification {
+    Stable(VerifiedSidecar),
+    #[cfg(unix)]
+    ChangedDuringRead,
+}
+
 /// Open `artifact` read-only and verify its footer checksum through that
 /// descriptor. Fails if the inode changed while it was being read.
 pub fn verify_sidecar_pinned(artifact: &Path) -> Result<VerifiedSidecar> {
+    match classify_sidecar_verification(artifact)? {
+        SidecarVerification::Stable(verified) => Ok(verified),
+        #[cfg(unix)]
+        SidecarVerification::ChangedDuringRead => Err(Error::agent(
+            "verify checkpoint checksum",
+            format!("{} changed while it was being verified", artifact.display()),
+        )),
+    }
+}
+
+pub(crate) fn classify_sidecar_verification(artifact: &Path) -> Result<SidecarVerification> {
+    classify_sidecar_verification_after_read(artifact, || {})
+}
+
+fn classify_sidecar_verification_after_read(
+    artifact: &Path,
+    after_read: impl FnOnce(),
+) -> Result<SidecarVerification> {
     let mut file = std::fs::File::open(artifact)
         .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
     #[cfg(unix)]
@@ -400,23 +424,21 @@ pub fn verify_sidecar_pinned(artifact: &Path) -> Result<VerifiedSidecar> {
             format!("checksum mismatch for {}", artifact.display()),
         ));
     }
+    after_read();
     #[cfg(unix)]
     let identity = {
         let after = SidecarIdentity::of(&file)?;
         if after != before {
-            return Err(Error::agent(
-                "verify checkpoint checksum",
-                format!("{} changed while it was being verified", artifact.display()),
-            ));
+            return Ok(SidecarVerification::ChangedDuringRead);
         }
         after
     };
-    Ok(VerifiedSidecar {
+    Ok(SidecarVerification::Stable(VerifiedSidecar {
         file,
         footer,
         #[cfg(unix)]
         identity,
-    })
+    }))
 }
 
 impl VerifiedSidecar {
@@ -2424,6 +2446,40 @@ mod tests {
         );
         Packer::new(manifest).pack_artifact(&artifact).unwrap();
         artifact
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_during_checksum_requires_new_proof_not_corruption_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "concurrent-link");
+        let alias = dir.path().join("second-reader");
+        let outcome = classify_sidecar_verification_after_read(&artifact, || {
+            std::fs::hard_link(&artifact, &alias).unwrap();
+        })
+        .unwrap();
+        assert!(matches!(outcome, SidecarVerification::ChangedDuringRead));
+        assert!(verified_sidecar_footer(&artifact).is_ok());
+        assert!(verified_sidecar_footer(&alias).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_after_checksum_cannot_produce_a_reusable_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "changed-bytes");
+        let outcome = classify_sidecar_verification_after_read(&artifact, || {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .unwrap()
+                .write_all(b"invalid")
+                .unwrap();
+        })
+        .unwrap();
+        assert!(matches!(outcome, SidecarVerification::ChangedDuringRead));
+        assert!(verified_sidecar_footer(&artifact).is_err());
     }
 
     #[cfg(unix)]
