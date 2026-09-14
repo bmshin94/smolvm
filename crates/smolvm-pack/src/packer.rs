@@ -19,19 +19,92 @@ const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
 
 struct DigestWriter<W> {
     inner: W,
-    sha256: Option<Sha256>,
+    sha256: Option<DigestWorker>,
+    digest_error: Option<std::io::Error>,
+}
+
+struct DigestWorker {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    worker: Option<std::thread::JoinHandle<Sha256>>,
+}
+
+impl DigestWorker {
+    fn spawn() -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let worker = std::thread::Builder::new()
+            .name("checkpoint-sha256".into())
+            .spawn(move || {
+                let mut digest = Sha256::new();
+                for bytes in receiver {
+                    digest.update(&bytes);
+                }
+                digest
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn update(&self, bytes: &[u8]) -> std::io::Result<()> {
+        // Two queued chunks, one producer chunk, and one consumer chunk bound
+        // additional payload memory to 4 MiB, irrespective of artifact size.
+        for chunk in bytes.chunks(1024 * 1024) {
+            self.sender
+                .as_ref()
+                .expect("live digest sender")
+                .send(chunk.to_vec())
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "checkpoint digest worker stopped",
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<String> {
+        drop(self.sender.take());
+        let digest = self
+            .worker
+            .take()
+            .expect("live digest worker")
+            .join()
+            .map_err(|_| std::io::Error::other("checkpoint digest worker failed"))?;
+        Ok(format!("{:x}", digest.finalize()))
+    }
+}
+
+impl Drop for DigestWorker {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl<W: Write> Write for DigestWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some(error) = &self.digest_error {
+            return Err(std::io::Error::new(error.kind(), error.to_string()));
+        }
         let written = self.inner.write(bytes)?;
         if let Some(digest) = &mut self.sha256 {
-            digest.update(&bytes[..written]);
+            // Once the file accepted bytes, report that progress accurately.
+            // A digest failure poisons subsequent writes and flush/publication.
+            if let Err(error) = digest.update(&bytes[..written]) {
+                self.digest_error = Some(error);
+            }
         }
         Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(error) = &self.digest_error {
+            return Err(std::io::Error::new(error.kind(), error.to_string()));
+        }
         self.inner.flush()
     }
 }
@@ -293,7 +366,8 @@ impl Packer {
         let temp_path = temp.into_temp_path();
         let artifact = ChecksummedWriter::new(DigestWriter {
             inner: File::create(&temp_path)?,
-            sha256: compute_digest.then(Sha256::new),
+            sha256: compute_digest.then(DigestWorker::spawn).transpose()?,
+            digest_error: None,
         });
         let mut artifact = if let Some(collector) = &self.asset_collector {
             collector.compress_to(artifact, false)?
@@ -320,23 +394,24 @@ impl Packer {
             checksum,
         };
         artifact.write_all(&footer.to_bytes())?;
+        artifact.flush()?;
         artifact.inner.sync_all()?;
-        let digest = artifact.sha256.map(|hash| format!("{:x}", hash.finalize()));
+        let digest = artifact.sha256.map(DigestWorker::finish).transpose()?;
         let file = artifact.inner;
 
         temp_path
             .persist_noclobber(output)
             .map_err(|error| error.error)?;
-        let identity = if let Some(digest) = digest {
-            Some(PackedArtifactIdentity {
-                #[cfg(unix)]
-                identity: PackedInode::of(&file)?,
-                file,
-                digest,
+        let identity = digest
+            .map(|digest| {
+                Ok::<_, std::io::Error>(PackedArtifactIdentity {
+                    #[cfg(unix)]
+                    identity: PackedInode::of(&file)?,
+                    file,
+                    digest,
+                })
             })
-        } else {
-            None
-        };
+            .transpose()?;
         Ok((
             PackedInfo {
                 stub_size: 0,
@@ -1174,6 +1249,31 @@ mod tests {
         assert_eq!(writer.bytes, 6);
         assert_eq!(writer.hasher.finalize(), crc32fast::hash(b"123456"));
         assert_eq!(writer.inner.0, b"123456");
+
+        let mut writer = DigestWriter {
+            inner: ShortWriter(Vec::new()),
+            sha256: Some(DigestWorker::spawn().unwrap()),
+            digest_error: None,
+        };
+        assert!(writer.write_all(b"123456789").is_err());
+        assert_eq!(writer.inner.0, b"123456");
+        assert_eq!(
+            writer.sha256.take().unwrap().finish().unwrap(),
+            format!("{:x}", Sha256::digest(b"123456"))
+        );
+    }
+
+    #[test]
+    fn failed_digest_worker_cannot_publish_a_digest() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        drop(receiver);
+        let worker = std::thread::spawn(|| -> Sha256 { panic!("test digest worker failure") });
+        let digest = DigestWorker {
+            sender: Some(sender),
+            worker: Some(worker),
+        };
+        assert!(digest.update(b"bytes").is_err());
+        assert!(digest.finish().is_err());
     }
 
     #[cfg(unix)]

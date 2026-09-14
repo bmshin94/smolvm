@@ -265,7 +265,39 @@ fn replace_checkpoint_cache_entry(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent")
     })?;
     let _lock = lock_checkpoint_cache_namespace(parent)?;
-    crate::artifact_cache::link_checkpoint_artifact(artifact, destination, true)
+    link_checkpoint_cache_alias(artifact, destination, true)
+}
+
+fn link_checkpoint_cache_alias(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    replace: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::artifact_cache::link_checkpoint_artifact(source, destination, replace)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if replace {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| std::io::Error::other("cache destination has no parent"))?;
+            let staging = tempfile::tempdir_in(parent)?;
+            let link = staging.path().join("artifact");
+            std::fs::hard_link(source, &link)?;
+            std::fs::rename(link, destination)?;
+        } else {
+            std::fs::hard_link(source, destination)?;
+        }
+        let _ = std::fs::File::options()
+            .append(true)
+            .open(destination)
+            .and_then(|file| {
+                file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
+            });
+        Ok(())
+    }
 }
 
 const CHECKPOINT_CACHE_LOCK: &str = ".checkpoint-cache.lock";
@@ -325,7 +357,7 @@ fn take_checkpoint_cache_entry(
             .parent()
             .ok_or_else(|| std::io::Error::other("cache source has no parent"))?;
         let _lock = lock_checkpoint_cache_namespace(parent)?;
-        crate::artifact_cache::link_checkpoint_artifact(src, artifact, false)
+        link_checkpoint_cache_alias(src, artifact, false)
     })();
     if let Err(error) = linked {
         tracing::warn!(key, error = %error, "cached checkpoint present but could not be linked");
@@ -407,7 +439,10 @@ struct CheckpointTransfer {
 
 impl Drop for CheckpointTransfer {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         crate::artifact_cache::release_checkpoint_artifact_alias(&self.artifact);
+        #[cfg(not(target_os = "linux"))]
+        let _ = &self.artifact;
     }
 }
 

@@ -443,7 +443,7 @@ impl VerifiedSidecar {
         }
         #[cfg(not(unix))]
         {
-            let _ = path;
+            let _ = (path, &self.file);
             false
         }
     }
@@ -1019,6 +1019,8 @@ pub fn capture_to_path(
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
     log_phase(name, "capture_pack", &mut phase);
+    #[cfg(not(target_os = "linux"))]
+    let _ = identity;
     #[cfg(target_os = "linux")]
     if options
         .prepared_cache_budget_bytes
