@@ -177,6 +177,62 @@ pub(crate) fn prepare_memory_backend(snapshot: &Path, branchable: bool) -> Resul
     }
 }
 
+// FINISH_SAVE consumes and closes its output file before replying. Only use
+// this handoff after that reply, under the source lock. Taking ownership of the
+// inode prevents the isolated VMM uid from reopening it after publication.
+#[cfg(target_os = "linux")]
+fn link_completed_memory(source: &Path, staged: &Path) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(false);
+    }
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(Error::agent(
+            "stage checkpoint RAM",
+            "memory image is not a regular file",
+        ));
+    }
+    if before.nlink() != 1 {
+        return Ok(false);
+    }
+    match std::fs::hard_link(source, staged) {
+        Ok(()) => {}
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EXDEV | libc::EOPNOTSUPP)) => {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let result = (|| -> std::io::Result<()> {
+        let linked = std::fs::symlink_metadata(staged)?;
+        if (linked.dev(), linked.ino()) != (before.dev(), before.ino()) {
+            return Err(std::io::Error::other(
+                "checkpoint RAM identity changed during staging",
+            ));
+        }
+        if unsafe { libc::fchown(file.as_raw_fd(), 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(staged);
+        return Err(error.into());
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
+    Ok(false)
+}
+
 pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
     tracing::info!(
         machine = name,
@@ -334,9 +390,89 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
 
 /// Verify a single-file artifact before reading its manifest or extracting it.
 pub fn verified_sidecar_footer(artifact: &Path) -> Result<smolvm_pack::format::PackFooter> {
-    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+    Ok(verify_sidecar_pinned(artifact)?.footer)
+}
+
+/// The exact inode a verification read, as the kernel reports it. `ctime` is
+/// kernel-maintained and moves on every content write, relink, unlink or
+/// timestamp change, so an equal identity means the same unchanged bytes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidecarIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl SidecarIdentity {
+    fn of(file: &std::fs::File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file
+            .metadata()
+            .map_err(|error| Error::agent("inspect checkpoint artifact", error.to_string()))?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+/// A single-file artifact whose footer checksum was verified through a
+/// descriptor the holder keeps open, pinning the very inode that was read.
+///
+/// This exists so one request can verify a cached artifact once and hand the
+/// result to the machine-creation path without a second full pass over the
+/// payload. Reuse is bound to the inode, never to a path or cache key:
+/// [`VerifiedSidecar::covers`] must hold for the path about to be used, or
+/// that path is verified from scratch.
+#[derive(Debug)]
+pub struct VerifiedSidecar {
+    file: std::fs::File,
+    footer: smolvm_pack::format::PackFooter,
+    #[cfg(unix)]
+    identity: SidecarIdentity,
+}
+
+pub(crate) enum SidecarVerification {
+    Stable(VerifiedSidecar),
+    #[cfg(unix)]
+    ChangedDuringRead,
+}
+
+/// Open `artifact` read-only and verify its footer checksum through that
+/// descriptor. Fails if the inode changed while it was being read.
+pub fn verify_sidecar_pinned(artifact: &Path) -> Result<VerifiedSidecar> {
+    match classify_sidecar_verification(artifact)? {
+        SidecarVerification::Stable(verified) => Ok(verified),
+        #[cfg(unix)]
+        SidecarVerification::ChangedDuringRead => Err(Error::agent(
+            "verify checkpoint checksum",
+            format!("{} changed while it was being verified", artifact.display()),
+        )),
+    }
+}
+
+pub(crate) fn classify_sidecar_verification(artifact: &Path) -> Result<SidecarVerification> {
+    classify_sidecar_verification_after_read(artifact, || {})
+}
+
+fn classify_sidecar_verification_after_read(
+    artifact: &Path,
+    after_read: impl FnOnce(),
+) -> Result<SidecarVerification> {
+    let mut file = std::fs::File::open(artifact)
         .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
-    if !smolvm_pack::packer::verify_sidecar_checksum(artifact, &footer)
+    #[cfg(unix)]
+    let before = SidecarIdentity::of(&file)?;
+    let footer = smolvm_pack::packer::read_footer_from_file(&mut file)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    if !smolvm_pack::packer::verify_sidecar_checksum_file(&mut file, &footer)
         .map_err(|error| Error::agent("verify checkpoint checksum", error.to_string()))?
     {
         return Err(Error::agent(
@@ -344,7 +480,51 @@ pub fn verified_sidecar_footer(artifact: &Path) -> Result<smolvm_pack::format::P
             format!("checksum mismatch for {}", artifact.display()),
         ));
     }
-    Ok(footer)
+    after_read();
+    #[cfg(unix)]
+    let identity = {
+        let after = SidecarIdentity::of(&file)?;
+        if after != before {
+            return Ok(SidecarVerification::ChangedDuringRead);
+        }
+        after
+    };
+    Ok(SidecarVerification::Stable(VerifiedSidecar {
+        file,
+        footer,
+        #[cfg(unix)]
+        identity,
+    }))
+}
+
+impl VerifiedSidecar {
+    /// The verified footer.
+    pub fn footer(&self) -> &smolvm_pack::format::PackFooter {
+        &self.footer
+    }
+
+    /// Whether `path` currently names exactly the inode this verification read,
+    /// and that inode is unchanged since (device, inode, length, mtime and ctime
+    /// all equal, for both the pinned descriptor and a fresh open of `path`).
+    /// A replacement at `path`, an in-place write, a relink, an unlink of any
+    /// other name (eviction) or a timestamp change all make this false, and the
+    /// caller must then verify `path` afresh. Never true off Unix.
+    pub fn covers(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let pinned = SidecarIdentity::of(&self.file).ok() == Some(self.identity);
+            let current = std::fs::File::open(path)
+                .ok()
+                .and_then(|file| SidecarIdentity::of(&file).ok())
+                == Some(self.identity);
+            pinned && current
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, &self.file);
+            false
+        }
+    }
 }
 
 struct RestoreReservation {
@@ -587,6 +767,17 @@ pub fn capture_to_path(
     output: &Path,
     options: &CaptureOptions,
 ) -> Result<CaptureResult> {
+    capture_to_path_with_source_release(name, output, options, || {})
+}
+
+/// Release API lifecycle ownership only after all input state belongs to this
+/// capture. The closure also owns the guard on errors or client disconnects.
+pub(crate) fn capture_to_path_with_source_release(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    release_source: impl FnOnce(),
+) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
     if options.store_dir.is_some() && options.staging_dir.is_some() {
@@ -698,8 +889,8 @@ pub fn capture_to_path(
     // A serve process has its own lifecycle mutex, but another CLI process
     // does not share it. Use the same source lock as `machine fork` so SAVE and
     // fork can never overlap or produce two competing source generations.
-    // Release it as soon as the source resumes; hashing and compression do not
-    // touch the live machine and must not delay a subsequent fork.
+    // Hold it through the RAM worker: its cgroup reservation must not race a
+    // fork resizing the same scope. Release before packaging and compression.
     let source_lock = crate::agent::fork::lock_fork_source(name)?;
     let config = validated_capture_source(name)?;
     let vm = config
@@ -762,7 +953,6 @@ pub fn capture_to_path(
     pause.resume()?;
     log_phase(name, "capture_disks_and_resume", &mut phase);
     let source_pause = pause_started.elapsed();
-    drop(source_lock);
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -808,6 +998,12 @@ pub fn capture_to_path(
     // Export sparse files after resume; streamed RAM is already in the store.
     for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
         if file == "memory.bin" && stored_memory.is_some() {
+            continue;
+        }
+        if file == "memory.bin"
+            && prepared
+            && link_completed_memory(&runtime_snapshot.join(file), &snapshot_dir.join(file))?
+        {
             continue;
         }
         crate::disk_utils::clone_or_copy_file(
@@ -890,6 +1086,10 @@ pub fn capture_to_path(
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
+    // Everything consumed below is capture-owned. Packaging and publication
+    // must not serialize new branches or other operations on the live source.
+    drop(source_lock);
+    release_source();
 
     if let Some((directory, mut writer)) = stored {
         let mut files = writer
@@ -923,19 +1123,36 @@ pub fn capture_to_path(
 
     let collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
-    let info = Packer::new(manifest)
+    let packer = Packer::new(manifest)
         .with_asset_collector(collector)
-        .pack_artifact(output)
-        .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+        .with_direct_artifact_io();
+    let retain = cfg!(target_os = "linux")
+        && options
+            .prepared_cache_budget_bytes
+            .is_some_and(|bytes| bytes > 0)
+        && smolvm_pack::extract::shared_extract_enabled();
+    let (info, identity) = if retain {
+        packer
+            .pack_artifact_with_identity(output)
+            .map(|(info, identity)| (info, Some(identity)))
+    } else {
+        packer.pack_artifact(output).map(|info| (info, None))
+    }
+    .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
     log_phase(name, "capture_pack", &mut phase);
+    #[cfg(not(target_os = "linux"))]
+    let _ = identity;
     #[cfg(target_os = "linux")]
     if options
         .prepared_cache_budget_bytes
         .is_some_and(|bytes| bytes > 0)
         && smolvm_pack::extract::shared_extract_enabled()
     {
-        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint(output, &staging_dir)
-        {
+        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
+            output,
+            &staging_dir,
+            identity.as_ref(),
+        ) {
             tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
         }
         if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(
@@ -2317,6 +2534,185 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_memory_staging_preserves_owned_inode_after_source_removal() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("runtime-memory");
+        let staged = dir.path().join("staged-memory");
+        std::fs::write(&source, b"captured RAM").unwrap();
+        let linked = link_completed_memory(&source, &staged).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!linked);
+            assert!(!staged.exists());
+            return;
+        }
+        assert!(linked);
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged).unwrap().ino()
+        );
+        let metadata = std::fs::metadata(&staged).unwrap();
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        std::fs::remove_file(source).unwrap();
+        assert_eq!(std::fs::read(staged).unwrap(), b"captured RAM");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_memory_staging_declines_preexisting_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"RAM").unwrap();
+        std::fs::hard_link(&source, dir.path().join("alias")).unwrap();
+        let staged = dir.path().join("staged");
+        assert!(!link_completed_memory(&source, &staged).unwrap());
+        assert!(!staged.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_memory_staging_never_clobbers_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let staged = dir.path().join("staged");
+        std::fs::write(&source, b"RAM").unwrap();
+        std::fs::write(&staged, b"existing").unwrap();
+        let result = link_completed_memory(&source, &staged);
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_err());
+        } else {
+            assert!(!result.unwrap());
+        }
+        assert_eq!(std::fs::read(staged).unwrap(), b"existing");
+    }
+
+    fn packed_sidecar(dir: &Path, name: &str, tag: &str) -> PathBuf {
+        let artifact = dir.join(name);
+        let manifest = smolvm_pack::format::PackManifest::new(
+            format!("vm://{tag}"),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        Packer::new(manifest).pack_artifact(&artifact).unwrap();
+        artifact
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_during_checksum_requires_new_proof_not_corruption_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "concurrent-link");
+        let alias = dir.path().join("second-reader");
+        let outcome = classify_sidecar_verification_after_read(&artifact, || {
+            std::fs::hard_link(&artifact, &alias).unwrap();
+        })
+        .unwrap();
+        assert!(matches!(outcome, SidecarVerification::ChangedDuringRead));
+        assert!(verified_sidecar_footer(&artifact).is_ok());
+        assert!(verified_sidecar_footer(&alias).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_after_checksum_cannot_produce_a_reusable_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "changed-bytes");
+        let outcome = classify_sidecar_verification_after_read(&artifact, || {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .unwrap()
+                .write_all(b"invalid")
+                .unwrap();
+        })
+        .unwrap();
+        assert!(matches!(outcome, SidecarVerification::ChangedDuringRead));
+        assert!(verified_sidecar_footer(&artifact).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_verification_covers_only_the_unchanged_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "pinned");
+        let link = dir.path().join("link");
+        std::fs::hard_link(&artifact, &link).unwrap();
+        let verified = verify_sidecar_pinned(&link).unwrap();
+        assert_eq!(
+            verified.footer().checksum,
+            smolvm_pack::packer::read_footer_from_sidecar(&artifact)
+                .unwrap()
+                .checksum
+        );
+        // Every name of the verified inode is covered; a different, equally
+        // valid artifact is not, whatever path it sits at.
+        assert!(verified.covers(&link));
+        assert!(verified.covers(&artifact));
+        let other = packed_sidecar(dir.path(), "other.smolcheckpoint", "other");
+        assert!(verified_sidecar_footer(&other).is_ok());
+        assert!(!verified.covers(&other));
+        // Replacement between validation and use: the new file at `link` is a
+        // different inode, and losing the `link` name moved the verified
+        // inode's ctime, so even its surviving name is no longer covered
+        // (conservative: a fresh verification of it still passes).
+        std::fs::rename(&other, &link).unwrap();
+        assert!(!verified.covers(&link));
+        assert!(!verified.covers(&artifact));
+        assert!(verified_sidecar_footer(&artifact).is_ok());
+        // In-place mutation of the pinned inode through another name.
+        let verified = verify_sidecar_pinned(&artifact).unwrap();
+        assert!(verified.covers(&artifact));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .unwrap();
+            file.write_all(b"x").unwrap();
+        }
+        assert!(!verified.covers(&artifact));
+        assert!(verified_sidecar_footer(&artifact).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_verification_is_conservative_across_eviction() {
+        // Unlinking another name (cache eviction or a cache put that relinks)
+        // changes the inode's ctime, so a handed-over verification stops
+        // covering it and the caller falls back to a full verification.
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "evict");
+        let staged = dir.path().join("staged");
+        std::fs::hard_link(&artifact, &staged).unwrap();
+        let verified = verify_sidecar_pinned(&staged).unwrap();
+        assert!(verified.covers(&staged));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::remove_file(&artifact).unwrap();
+        assert!(!verified.covers(&staged));
+        // The staged link is still a valid artifact; fresh verification passes.
+        assert!(verified_sidecar_footer(&staged).is_ok());
+    }
+
+    #[test]
+    fn pinned_verification_rejects_a_corrupt_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "corrupt");
+        let mut bytes = std::fs::read(&artifact).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        std::fs::write(&artifact, &bytes).unwrap();
+        let error = verify_sidecar_pinned(&artifact).unwrap_err().to_string();
+        assert!(error.contains("checksum mismatch"), "{error}");
+        std::fs::write(&artifact, b"short").unwrap();
+        assert!(verify_sidecar_pinned(&artifact).is_err());
+    }
 
     #[test]
     fn readonly_restore_consumption_preserves_shared_input() {
