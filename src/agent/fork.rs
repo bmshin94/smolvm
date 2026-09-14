@@ -1980,6 +1980,7 @@ pub(crate) fn prepare_forks_reusing(
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
 ) -> Result<PreparedForkBatch> {
+    let preparation_started = std::time::Instant::now();
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
@@ -2066,6 +2067,7 @@ pub(crate) fn prepare_forks_reusing(
         ));
     }
     let golden_was_paused = fork_base_already_paused(&status);
+    tracing::info!(%golden, phase = "source_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
     let fork_continue = fork_continue_enabled();
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
@@ -2173,6 +2175,7 @@ pub(crate) fn prepare_forks_reusing(
             let _ = std::fs::remove_dir_all(&snapshot_dir);
             return Err(error);
         }
+        tracing::info!(%golden, phase = "guest_synced", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
 
         let forkpoint_armed = match arm_forkpoint_for_capture(golden) {
             Ok(armed) => armed,
@@ -2197,6 +2200,7 @@ pub(crate) fn prepare_forks_reusing(
             }
         }
 
+        tracing::info!(%golden, phase = "disk_generation_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
         #[cfg(target_os = "linux")]
         let mut lineage_memory_reservation = if fork_continue {
             let reservation =
@@ -2227,6 +2231,7 @@ pub(crate) fn prepare_forks_reusing(
         };
 
         let t_snap = std::time::Instant::now();
+        tracing::info!(%golden, phase = "memory_reserved", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
         // Active children map one sparse materialized memfd generation so CPU-
         // and I/O-heavy work never serializes behind page-by-page delivery.
         // Held pool slots use the same shared generation because they may run a
