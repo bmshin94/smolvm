@@ -1725,6 +1725,34 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Fork clone: boot from a snapshot dir (CoW-map a golden VM's RAM +
         // restore state) instead of cold-booting, when SMOLVM_SNAPSHOT_DIR is set.
+        #[cfg(target_os = "linux")]
+        if let Some(raw) = std::env::var_os("SMOLVM_READONLY_RESTORE_FD") {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            std::env::remove_var("SMOLVM_READONLY_RESTORE_FD");
+            let fd: i32 = try_or_free_ctx!(
+                raw.to_string_lossy().parse(),
+                "restore RAM",
+                "invalid input descriptor"
+            );
+            if fd < 3 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent("restore RAM", "invalid input descriptor"));
+            }
+            let input = OwnedFd::from_raw_fd(fd);
+            let set_memory = try_or_free_ctx!(
+                krun.set_snapshot_memory_fd.ok_or(()),
+                "restore RAM",
+                "libkrun lacks read-only snapshot memory support"
+            );
+            let result = set_memory(ctx, input.as_raw_fd());
+            if result < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "restore RAM",
+                    format!("libkrun rejected read-only input: {result}"),
+                ));
+            }
+        }
         if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
             if !snap_dir.is_empty() {
                 match krun.set_snapshot {

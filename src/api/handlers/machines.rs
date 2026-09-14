@@ -559,6 +559,7 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let mut checkpoint_phase = std::time::Instant::now();
     // Validate: registry_ref, from, and image are mutually exclusive
     let source_count = [
         req.registry_ref.is_some(),
@@ -942,6 +943,9 @@ pub async fn create_machine(
         .map(|network| network.enabled)
         .unwrap_or(req.network || manifest_net);
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
+    }
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
@@ -958,6 +962,9 @@ pub async fn create_machine(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_prepare", &mut checkpoint_phase);
+    }
     // Extract the bundle's OCI layers into this machine's own data dir (created
     // by the manager above) rather than the shared pack cache, so every start is
     // independent of the .smolmachine file surviving and the macOS layers volume
@@ -1038,6 +1045,9 @@ pub async fn create_machine(
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_extract", &mut checkpoint_phase);
+    }
     // VM-mode pack: seed this machine's overlay + storage disks from the packed
     // templates (extracted above) so a start boots the source VM's rootfs rather
     // than the bare agent-rootfs (the /bin/sh-missing bug). `open_or_create_at`
@@ -1095,6 +1105,9 @@ pub async fn create_machine(
         }
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_seed", &mut checkpoint_phase);
+    }
     // Install a live checkpoint only after the ordinary VM-mode templates have
     // been seeded. The checkpoint's exact qcow chains must be the final disk
     // publication; seeding afterwards would silently replace the captured
@@ -1126,6 +1139,9 @@ pub async fn create_machine(
         }
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
+    }
     let resources = ResourceSpec {
         cpus: Some(cpus),
         memory_mb: Some(mem),
@@ -1214,6 +1230,7 @@ pub async fn create_machine(
             .as_ref()
             .and_then(|checkpoint| checkpoint.workload.as_ref())
             .map(|workload| workload.overlay_owner.clone()),
+        host_uid_owner: manifest_checkpoint.as_ref().map(|_| name.clone()),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
         // refs win on key collision. Both sources are store-only, so RecordReplay
@@ -1597,7 +1614,7 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
-    let record_fork_overlay_owner = record.fork_overlay_owner.clone();
+    let record_fork_overlay_owner = record.vm_uid_owner().map(str::to_string);
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
@@ -2262,11 +2279,7 @@ async fn boot_prepared_fork_inner(
         features.snapshot_dir = Some(prep.snapshot_dir);
         // A nested branch must keep the original lineage's UID, not allocate
         // a new UID from the immediate parent's snapshot directory.
-        features.uid_share_dir = record
-            .fork_overlay_owner
-            .as_deref()
-            .or(record.golden.as_deref())
-            .map(crate::agent::vm_data_dir);
+        features.uid_share_dir = record.vm_uid_owner().map(crate::agent::vm_data_dir);
         features.cuda_share_weights = share_weights;
         features.cuda_preload_modules = record.cuda_preload_modules;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;

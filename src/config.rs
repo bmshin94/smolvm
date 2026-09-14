@@ -621,6 +621,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_overlay_owner: Option<String>,
 
+    /// Host UID lineage, independent of names inside the guest filesystem.
+    /// Portable restores establish a new host lineage while retaining guest names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_uid_owner: Option<String>,
+
     /// Whether a fork clone is still parked at the inherited workload
     /// forkpoint. Held clones are clean, already-booted pool slots: a caller
     /// installs the job-specific fork parameters and releases each slot once.
@@ -673,6 +678,14 @@ fn default_mem() -> u32 {
 }
 
 impl VmRecord {
+    /// Host identity owner; guest overlay names only serve as a legacy fallback.
+    pub fn vm_uid_owner(&self) -> Option<&str> {
+        self.host_uid_owner
+            .as_deref()
+            .or(self.fork_overlay_owner.as_deref())
+            .or(self.golden.as_deref())
+    }
+
     /// Whether an ordinary start should launch this machine as a fork base.
     ///
     /// The pool check preserves the behavior of records created before the
@@ -747,6 +760,7 @@ impl VmRecord {
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
+            host_uid_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
@@ -819,6 +833,7 @@ impl VmRecord {
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
+            host_uid_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
@@ -1561,6 +1576,7 @@ mod tests {
         let mut record = VmRecord::new("slot-0".to_string(), 2, 1024, vec![], vec![], false);
         record.golden = Some("golden".to_string());
         record.fork_overlay_owner = Some("root".to_string());
+        record.host_uid_owner = Some("local-restore".to_string());
         record.forkpoint_held = true;
         record.fork_env = vec![("SMOLVM_FORK_INDEX".to_string(), "0".to_string())];
 
@@ -1569,12 +1585,18 @@ mod tests {
         assert!(decoded.forkpoint_held);
         assert_eq!(decoded.fork_env, record.fork_env);
         assert_eq!(decoded.fork_overlay_owner.as_deref(), Some("root"));
+        assert_eq!(decoded.vm_uid_owner(), Some("local-restore"));
+        let mut child = decoded.clone();
+        child.name = "nested".to_string();
+        child.golden = Some(decoded.name.clone());
+        assert_eq!(child.vm_uid_owner(), Some("local-restore"));
 
         let mut legacy_value = encoded;
         let legacy_object = legacy_value.as_object_mut().unwrap();
         legacy_object.remove("forkpoint_held");
         legacy_object.remove("fork_env");
         legacy_object.remove("fork_overlay_owner");
+        legacy_object.remove("host_uid_owner");
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert!(!legacy.forkpoint_held);
         assert!(legacy.fork_env.is_empty());
