@@ -135,6 +135,8 @@ pub struct ApiState {
 
 /// Internal machine entry with manager and configuration.
 pub struct MachineEntry {
+    /// Resolved workload image, matching the persisted machine record.
+    pub image: Option<String>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts configured for this machine.
@@ -534,6 +536,7 @@ impl ApiState {
                     machines.insert(
                         name.clone(),
                         Arc::new(parking_lot::Mutex::new(MachineEntry {
+                            image: record.image.clone(),
                             manager,
                             mounts,
                             ports,
@@ -1090,6 +1093,7 @@ impl ApiState {
                 machines.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(MachineEntry {
+                        image: record.image.clone(),
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
@@ -1736,6 +1740,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
 
     MachineInfo {
         name,
+        image: entry.image.clone(),
         state: state.to_string(),
         cpus: entry.resources.cpus.unwrap_or(1),
         mem: entry.resources.memory_mb.unwrap_or(512),
@@ -1924,6 +1929,7 @@ mod tests {
             name,
             MachineEntry {
                 manager: AgentManager::for_vm(name).unwrap(),
+                image: None,
                 mounts: vec![],
                 ports: vec![],
                 resources: ResourceSpec {
@@ -1981,6 +1987,7 @@ mod tests {
             "remove-test-m1",
             MachineEntry {
                 manager,
+                image: None,
                 mounts: vec![],
                 ports: vec![],
                 resources: ResourceSpec {
@@ -2049,6 +2056,7 @@ mod tests {
             "busy-m1",
             MachineEntry {
                 manager,
+                image: None,
                 mounts: vec![],
                 ports: vec![],
                 resources: ResourceSpec {

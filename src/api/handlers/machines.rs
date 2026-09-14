@@ -79,6 +79,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
         name: name.to_string(),
+        image: record.image.clone(),
         state: actual_state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
@@ -366,6 +367,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         .collect();
     MachineEntry {
         manager,
+        image: record.image.clone(),
         mounts,
         ports,
         resources: ResourceSpec {
@@ -3499,6 +3501,29 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn machine_response_reports_resolved_image_for_registry_binding() {
+        let mut record = VmRecord::new("image-contract".into(), 1, 512, vec![], vec![], false);
+        let bare = serde_json::to_value(record_to_info("image-contract", &record)).unwrap();
+        assert!(bare.get("image").is_none());
+        for image in [
+            "registry.smolmachines.com/tenants/example/app:latest",
+            "ghcr.io/example/app:latest",
+        ] {
+            record.image = Some(image.into());
+            let response = serde_json::to_value(record_to_info("image-contract", &record)).unwrap();
+            assert_eq!(response["image"], image);
+            let manager = AgentManager::for_vm("image-contract").unwrap();
+            let entry = machine_entry_from_record(&record, manager);
+            let cached = serde_json::to_value(crate::api::state::machine_entry_to_info(
+                "image-contract".into(),
+                &entry,
+            ))
+            .unwrap();
+            assert_eq!(cached["image"], image);
+        }
+    }
 
     #[test]
     fn checkpoint_ports_allow_host_rebinding_but_preserve_guest_topology() {
