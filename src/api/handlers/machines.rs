@@ -459,6 +459,8 @@ pub async fn capture_portable_checkpoint(
             tracing::warn!(%error, "checkpoint cache task failed");
         }
     }
+    #[cfg(target_os = "linux")]
+    let prepared_reference = crate::artifact_cache::prepared_checkpoint_reference(&artifact).ok();
     let mut file = tokio::fs::File::open(&artifact)
         .await
         .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
@@ -481,7 +483,14 @@ pub async fn capture_portable_checkpoint(
             }
         }
     };
-    Response::builder()
+    let response = Response::builder();
+    #[cfg(target_os = "linux")]
+    let response = if let Some(reference) = prepared_reference {
+        response.header("x-smolvm-checkpoint-prepared", reference)
+    } else {
+        response
+    };
+    response
         .status(axum::http::StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
@@ -1126,6 +1135,26 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    #[cfg(target_os = "linux")]
+    let mut req = req;
+    #[cfg(target_os = "linux")]
+    let _prepared = if let Some(reference) = req
+        .from
+        .as_ref()
+        .filter(|value| value.starts_with("checkpoint://"))
+    {
+        let reference = reference.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::artifact_cache::open_prepared_checkpoint(&reference)
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        req.from = Some(prepared.path.to_string_lossy().into_owned());
+        Some(prepared)
+    } else {
+        None
+    };
     let mut checkpoint_phase = std::time::Instant::now();
     // Validate: registry_ref, from, and image are mutually exclusive
     let source_count = [
@@ -1157,6 +1186,7 @@ pub async fn create_machine(
     }
 
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
+    #[cfg(not(target_os = "linux"))]
     let mut req = req;
     if let Some(ref registry_ref) = req.registry_ref.clone() {
         let pulled_path = pull_from_registry(

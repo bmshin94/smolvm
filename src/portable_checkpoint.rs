@@ -908,13 +908,23 @@ pub fn capture_to_path(
         });
     }
 
-    let collector = AssetCollector::new(staging_dir)
+    let collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
     let info = Packer::new(manifest)
         .with_asset_collector(collector)
         .pack_artifact(output)
         .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
     log_phase(name, "capture_pack", &mut phase);
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SMOLVM_RETAIN_PREPARED_CHECKPOINT").is_some()
+        && smolvm_pack::extract::shared_extract_enabled()
+    {
+        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint(output, &staging_dir)
+        {
+            tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+        }
+        log_phase(name, "capture_retain_prepared", &mut phase);
+    }
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,
@@ -2013,6 +2023,7 @@ pub fn install(
 
     let result = (|| -> Result<()> {
         for (asset, expected) in expected_assets(checkpoint) {
+            let started = std::time::Instant::now();
             if asset.path != expected {
                 return Err(Error::agent(
                     "install checkpoint",
@@ -2026,6 +2037,12 @@ pub fn install(
                 && stage_readonly_memory(&extracted.join(expected), vm_data_dir, asset)?
             {
                 std::fs::write(partial.join(READONLY_INPUT_MARKER), b"1\n")?;
+                tracing::info!(
+                    asset = expected,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    method = "readonly_link",
+                    "checkpoint payload installed"
+                );
                 continue;
             }
             copy_verified(
@@ -2034,6 +2051,12 @@ pub fn install(
                 asset,
                 expected == "checkpoint/memory.bin",
             )?;
+            tracing::info!(
+                asset = expected,
+                elapsed_ms = started.elapsed().as_millis(),
+                method = "copy_or_link",
+                "checkpoint payload installed"
+            );
         }
 
         let staged_disks = partial.join("disks");
@@ -2041,6 +2064,7 @@ pub fn install(
             .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
         for disk in &checkpoint.disks {
             for (index, file) in disk.files.iter().enumerate() {
+                let started = std::time::Instant::now();
                 let staged = staged_disks.join(&file.target);
                 let source = extracted.join(&file.asset.path);
                 if index == 0 {
@@ -2066,6 +2090,7 @@ pub fn install(
                         ));
                     }
                 }
+                tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = index == 0, "checkpoint disk installed");
             }
         }
         std::fs::write(partial.join(PENDING_MARKER), b"1\n")

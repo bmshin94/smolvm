@@ -592,6 +592,101 @@ fn safe_unpack_with_limits<R: Read>(
     safe_unpack_with_policy(archive, dest, limits, false)
 }
 
+// Both operations must succeed before returning the input to the installer. Do not join writeback
+// before verification: that merely moves the same wait earlier in import.
+fn overlap_checkpoint_writeback<T>(
+    flush: impl FnOnce() -> std::io::Result<()> + Send,
+    verify: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("checkpoint-fsync".into())
+            .spawn_scoped(scope, flush)?;
+        let verified = verify();
+        worker
+            .join()
+            .map_err(|_| std::io::Error::other("checkpoint writeback worker failed"))??;
+        verified
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod checkpoint_writeback_tests {
+    use super::*;
+
+    #[test]
+    fn writeback_preserves_bytes_and_final_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.bin");
+        let mut file = File::create(&path).unwrap();
+        let data = vec![0x71; 1024 * 1024];
+        for _ in 0..16 {
+            file.write_all(&data).unwrap();
+        }
+        overlap_checkpoint_writeback(|| File::open(&path)?.sync_all(), || Ok(())).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), data.repeat(16));
+    }
+
+    #[test]
+    fn missing_input_does_not_create_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent");
+        assert!(overlap_checkpoint_writeback(|| File::open(&path)?.sync_all(), || Ok(())).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn verification_overlaps_flush_and_waits_for_completion() {
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let complete = std::sync::atomic::AtomicBool::new(false);
+        let complete_ref = &complete;
+        overlap_checkpoint_writeback(
+            move || {
+                started.send(()).unwrap();
+                wait_release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                complete_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                wait_started
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                release.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(complete.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_verification_still_joins_writeback() {
+        let complete = std::sync::atomic::AtomicBool::new(false);
+        let result: std::io::Result<()> = overlap_checkpoint_writeback(
+            || {
+                complete.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || Err(std::io::Error::other("invalid digest")),
+        );
+        assert!(result.is_err());
+        assert!(complete.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn successful_verification_does_not_hide_writeback_failure() {
+        let result = overlap_checkpoint_writeback(
+            || Err(std::io::Error::other("writeback failed")),
+            || Ok("verified"),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "writeback failed");
+    }
+}
+
 fn safe_unpack_with_policy<R: Read>(
     archive: &mut tar::Archive<R>,
     dest: &Path,
@@ -1426,6 +1521,77 @@ pub fn shared_pack_dir(shared_root: &Path, checksum: u32) -> PathBuf {
     shared_root.join(format!("{:08x}", checksum))
 }
 
+/// Retain the owned, immutable staging tree used to produce a local checkpoint.
+/// Only the capture path may call this: `prepared` must be the exact tree just
+/// packed into `sidecar`, with no live guest writers or untrusted path aliases.
+#[cfg(target_os = "linux")]
+pub fn retain_prepared_checkpoint(
+    sidecar: &Path,
+    prepared: &Path,
+    shared_root: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let footer = crate::packer::read_footer_from_sidecar(sidecar).map_err(std::io::Error::other)?;
+    let manifest =
+        crate::packer::read_manifest_from_sidecar(sidecar).map_err(std::io::Error::other)?;
+    if !crate::packer::verify_sidecar_checksum(sidecar, &footer).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::other(
+            "prepared checkpoint checksum mismatch",
+        ));
+    }
+    if manifest.checkpoint.is_none() || !manifest.assets.layers.is_empty() {
+        return Err(std::io::Error::other(
+            "prepared cache requires a captured checkpoint",
+        ));
+    }
+    fs::create_dir_all(shared_root)?;
+    fs::set_permissions(shared_root, fs::Permissions::from_mode(0o700))?;
+    let target = shared_pack_dir(shared_root, footer.checksum);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(target.with_extension("lock"))?;
+    lock_file_exclusive(&lock)?;
+    if is_extracted(&target) {
+        ensure_shared_artifact_sha256(sidecar, &target)?;
+        return Ok(());
+    }
+    // Do not expose the completion marker until all payloads are durable.
+    post_process_extraction(prepared, &[], true, false)?;
+    fs::set_permissions(
+        prepared.join("checkpoint/memory.bin"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    fn sync_tree(path: &Path) -> std::io::Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                sync_tree(&entry.path())?;
+            } else if kind.is_file() {
+                File::open(entry.path())?.sync_all()?;
+            }
+        }
+        File::open(path)?.sync_all()
+    }
+    sync_tree(prepared)?;
+    fs::set_permissions(prepared, fs::Permissions::from_mode(0o700))?;
+    // A previous incomplete extraction is disposable under the entry lock.
+    if target.exists() {
+        fs::remove_dir_all(&target)?;
+    }
+    let retained_artifact = target.with_extension("prepared.smolcheckpoint");
+    if retained_artifact.exists() {
+        fs::remove_file(&retained_artifact)?;
+    }
+    fs::hard_link(sidecar, &retained_artifact)?;
+    ensure_shared_artifact_sha256(&retained_artifact, &target)?;
+    fs::rename(prepared, &target)?;
+    File::open(shared_root)?.sync_all()?;
+    Ok(())
+}
+
 /// Extract a sidecar pack ONCE into the shared content-addressed store and return
 /// the path to the shared copy (`shared_root/<checksum>`).
 ///
@@ -1459,7 +1625,19 @@ pub fn extract_sidecar_shared(
     // each machine's `.pack-shared` pointer as a durable lease and therefore
     // cannot delete a pack mounted by a running or stopped VM.
     extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
-    ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
+    let overlap = cfg!(target_os = "linux")
+        && std::env::var_os("SMOLVM_CHECKPOINT_WRITEBACK").is_some()
+        && crate::packer::read_manifest_from_sidecar(sidecar_path)
+            .is_ok_and(|m| m.checkpoint.is_some());
+    if overlap {
+        let memory = shared_dir.join("checkpoint/memory.bin");
+        overlap_checkpoint_writeback(
+            || File::open(&memory)?.sync_all(),
+            || ensure_shared_artifact_sha256(sidecar_path, &shared_dir),
+        )?;
+    } else {
+        ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
+    }
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
     // by root (the VMM before it drops privileges) is unaffected by 0700.

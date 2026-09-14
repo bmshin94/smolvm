@@ -257,6 +257,82 @@ pub fn materialize_shared_pack_lease(
     Ok(lease)
 }
 
+/// Publish capture-owned prepared state without racing explicit cache pruning.
+pub fn retain_prepared_checkpoint(sidecar: &Path, prepared: &Path) -> io::Result<()> {
+    let file = fs::symlink_metadata(sidecar)?;
+    let parent = fs::metadata(
+        sidecar
+            .parent()
+            .ok_or_else(|| io::Error::other("capture has no parent"))?,
+    )?;
+    if !file.is_file() || file.uid() != 0 || parent.uid() != 0 || parent.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "prepared retention requires a service-owned capture in a private directory",
+        ));
+    }
+    let _lock = lock_artifact_cache(&vm_cache_root(), false)?;
+    smolvm_pack::extract::retain_prepared_checkpoint(sidecar, prepared, &shared_pack_cache_root())
+}
+
+/// A prepared input pinned against cache pruning for the duration of import.
+pub struct PreparedCheckpoint {
+    /// Service-owned artifact retaining the capture's verified identity.
+    pub path: PathBuf,
+    _lock: ArtifactCacheLock,
+}
+
+/// Return the node-local reference for a retained capture, if still available.
+pub fn prepared_checkpoint_reference(sidecar: &Path) -> io::Result<String> {
+    let footer =
+        smolvm_pack::packer::read_footer_from_sidecar(sidecar).map_err(io::Error::other)?;
+    let shared = smolvm_pack::extract::shared_pack_dir(&shared_pack_cache_root(), footer.checksum);
+    let digest = read_artifact_digest(&shared)?;
+    let source = fs::metadata(sidecar)?;
+    let retained = fs::metadata(shared.with_extension("prepared.smolcheckpoint"))?;
+    if !retained.is_file() || source.dev() != retained.dev() || source.ino() != retained.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this capture has no retained prepared checkpoint",
+        ));
+    }
+    Ok(format!("checkpoint://{:08x}-{digest}", footer.checksum))
+}
+
+/// Pin a node-local capture through import so pruning cannot remove its inputs.
+pub fn open_prepared_checkpoint(reference: &str) -> io::Result<PreparedCheckpoint> {
+    let key = reference.strip_prefix("checkpoint://").unwrap_or("");
+    let (crc, digest) = key.split_once('-').unwrap_or(("", ""));
+    if crc.len() != 8
+        || digest.len() != 64
+        || !crc
+            .bytes()
+            .chain(digest.bytes())
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid prepared checkpoint reference",
+        ));
+    }
+    let lock = lock_artifact_cache(&vm_cache_root(), false)?;
+    let shared = shared_pack_cache_root().join(crc);
+    if read_artifact_digest(&shared)? != digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prepared checkpoint identity mismatch",
+        ));
+    }
+    let path = shared.with_extension("prepared.smolcheckpoint");
+    if !path.is_file() || !smolvm_pack::extract::is_extracted(&shared) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "prepared checkpoint evicted; use the durable artifact",
+        ));
+    }
+    Ok(PreparedCheckpoint { path, _lock: lock })
+}
+
 /// Copy a golden machine's shared artifact lease to a fork clone atomically.
 ///
 /// Returns `None` when the golden uses a private extraction rather than the
@@ -412,6 +488,7 @@ fn metadata_paths_for_shared(shared_dir: &Path) -> Vec<PathBuf> {
         digest.clone(),
         digest.with_extension("artifact-sha256.lock"),
         shared_dir.with_extension("artifact-source.json"),
+        shared_dir.with_extension("prepared.smolcheckpoint"),
     ]
 }
 
@@ -896,4 +973,26 @@ mod tests {
         assert_eq!(report.entries[0].artifact, "shared:deadbeef");
         assert!(!shared.exists());
     }
+}
+#[test]
+fn prepared_reference_rejects_paths_and_incomplete_digests() {
+    for reference in [
+        "checkpoint://../x",
+        "checkpoint://12345678-x",
+        "checkpoint://12345678/abc",
+        "not-a-checkpoint",
+    ] {
+        assert!(open_prepared_checkpoint(reference).is_err());
+    }
+}
+
+#[test]
+fn prepared_retention_rejects_nonprivate_capture_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let artifact = dir.path().join("capture.smolcheckpoint");
+    fs::write(&artifact, b"unchanged").unwrap();
+    let error = retain_prepared_checkpoint(&artifact, dir.path()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read(artifact).unwrap(), b"unchanged");
 }
