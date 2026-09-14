@@ -399,6 +399,18 @@ fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
     Ok(root)
 }
 
+/// Refresh local alias provenance before TempDir removes the transfer files.
+struct CheckpointTransfer {
+    _directory: tempfile::TempDir,
+    artifact: std::path::PathBuf,
+}
+
+impl Drop for CheckpointTransfer {
+    fn drop(&mut self) {
+        crate::artifact_cache::release_checkpoint_artifact_alias(&self.artifact);
+    }
+}
+
 fn max_checkpoint_upload_bytes() -> u64 {
     std::env::var("SMOLVM_MAX_CHECKPOINT_UPLOAD_BYTES")
         .ok()
@@ -600,6 +612,10 @@ pub async fn capture_portable_checkpoint(
     })
     .await?;
     let result = result.map_err(checkpoint_capture_error)?;
+    let transfer = CheckpointTransfer {
+        _directory: transfer,
+        artifact: artifact.clone(),
+    };
 
     if let Some(key) = capture_options.cache_key {
         let artifact = artifact.clone();
@@ -979,6 +995,10 @@ pub async fn restore_portable_checkpoint(
         .tempdir_in(checkpoint_transfer_root()?)
         .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
     let artifact = transfer.path().join("upload.smolcheckpoint");
+    let _transfer = CheckpointTransfer {
+        _directory: transfer,
+        artifact: artifact.clone(),
+    };
     let limit = max_checkpoint_upload_bytes();
     // A cached artifact is hard-linked straight into the staging directory:
     // nothing is created or fetched, and the cache's own inode is untouched by

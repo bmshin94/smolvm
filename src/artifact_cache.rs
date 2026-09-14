@@ -348,6 +348,17 @@ pub fn link_checkpoint_artifact(
     )
 }
 
+/// Finish a private transfer alias; stale identities retain full verification.
+pub fn release_checkpoint_artifact_alias(artifact: &Path) {
+    #[cfg(target_os = "linux")]
+    let _ = smolvm_pack::extract::release_checkpoint_artifact_alias(
+        artifact,
+        &shared_pack_cache_root(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = artifact;
+}
+
 /// Pin a node-local capture through import so pruning cannot remove its inputs.
 pub fn open_prepared_checkpoint(reference: &str) -> io::Result<PreparedCheckpoint> {
     let key = reference.strip_prefix("checkpoint://").unwrap_or("");

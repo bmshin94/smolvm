@@ -1760,12 +1760,22 @@ fn service_owned_artifact(path: &Path) -> bool {
 fn artifact_source_identity(sidecar_path: &Path) -> std::io::Result<ArtifactSourceIdentity> {
     let canonical = sidecar_path.canonicalize()?;
     let metadata = fs::metadata(&canonical)?;
+    Ok(artifact_metadata_identity(
+        canonical.to_string_lossy().into_owned(),
+        &metadata,
+    ))
+}
+
+fn artifact_metadata_identity(
+    canonical_path: String,
+    metadata: &fs::Metadata,
+) -> ArtifactSourceIdentity {
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
-    Ok(ArtifactSourceIdentity {
-        canonical_path: canonical.to_string_lossy().into_owned(),
+    ArtifactSourceIdentity {
+        canonical_path,
         len: metadata.len(),
         modified_secs: modified.map(|duration| duration.as_secs()),
         modified_nanos: modified.map(|duration| duration.subsec_nanos()),
@@ -1782,11 +1792,59 @@ fn artifact_source_identity(sidecar_path: &Path) -> std::io::Result<ArtifactSour
         #[cfg(not(unix))]
         inode: None,
         locally_produced: false,
-    })
+    }
 }
 
 fn shared_artifact_source_path(shared_dir: &Path) -> PathBuf {
     shared_dir.with_extension("artifact-source.json")
+}
+
+/// Release a private transfer alias without invalidating its local digest.
+/// This is best effort: contention or stale provenance leaves ordinary TempDir
+/// cleanup to invalidate the identity, requiring verification on the next use.
+#[cfg(target_os = "linux")]
+pub fn release_checkpoint_artifact_alias(source: &Path, shared_root: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if !service_owned_artifact(source) {
+        return Ok(());
+    }
+    let footer = crate::packer::read_footer_from_sidecar(source).map_err(std::io::Error::other)?;
+    let shared = shared_pack_dir(shared_root, footer.checksum);
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(shared_artifact_sha256_path(&shared).with_extension("artifact-sha256.lock"))?;
+    // Drop may execute on an async worker. Never wait behind a full-file hash.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(());
+    }
+    let before = artifact_source_identity(source)?;
+    let cached: ArtifactSourceIdentity =
+        serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared))?)
+            .map_err(std::io::Error::other)?;
+    if !cached.covers_local(&before) {
+        return Ok(());
+    }
+    let pinned = File::open(source)?;
+    if !before.same_inode(&artifact_metadata_identity(
+        before.canonical_path.clone(),
+        &pinned.metadata()?,
+    )) {
+        return Ok(());
+    }
+    fs::remove_file(source)?;
+    let mut after = artifact_metadata_identity(before.canonical_path.clone(), &pinned.metadata()?);
+    if !before.same_inode(&after)
+        || before.len != after.len
+        || before.modified_secs != after.modified_secs
+        || before.modified_nanos != after.modified_nanos
+    {
+        return Ok(());
+    }
+    after.locally_produced = true;
+    write_atomic_marker(
+        &shared_artifact_source_path(&shared),
+        &serde_json::to_vec(&after).map_err(std::io::Error::other)?,
+    )
 }
 
 /// Create a service-owned cache alias and account for its metadata-only change.
@@ -3916,6 +3974,25 @@ mod tests {
             ensure_shared_artifact_sha256(&alias, &shared).unwrap(),
             digest
         );
+        // Service-owned request cleanup must preserve the proof after unlink.
+        #[cfg(target_os = "linux")]
+        release_checkpoint_artifact_alias(&artifact, temp.path()).unwrap();
+        if artifact.exists() {
+            fs::remove_file(&artifact).unwrap();
+        }
+        if local {
+            let recorded: ArtifactSourceIdentity =
+                serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                recorded.covers_local(&artifact_source_identity(&alias).unwrap()),
+                cfg!(target_os = "linux")
+            );
+            assert_eq!(
+                ensure_shared_artifact_sha256(&alias, &shared).unwrap(),
+                digest
+            );
+        }
         let upload = temp.path().join("upload");
         fs::copy(&alias, &upload).unwrap();
         assert_eq!(
