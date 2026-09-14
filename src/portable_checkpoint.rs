@@ -722,6 +722,7 @@ pub fn capture_to_path(
         std::time::Duration::from_secs(30 * 60),
     )?;
     let prepared = reply.starts_with("OK");
+    tracing::info!(machine = name, command = "PREPARE_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     if !prepared
         && options.store_dir.is_none()
         && (reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command")
@@ -731,6 +732,7 @@ pub fn capture_to_path(
             &format!("SAVE {}", runtime_snapshot.display()),
             std::time::Duration::from_secs(30 * 60),
         )?;
+        tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
     if !reply.starts_with("OK") {
         return Err(Error::agent(
@@ -747,7 +749,15 @@ pub fn capture_to_path(
     if prepared {
         memory_reservation.checkpoint_prepared()?;
     }
-    log_phase(name, "capture_prepare_memory", &mut phase);
+    log_phase(
+        name,
+        if prepared {
+            "capture_prepare_memory_deferred"
+        } else {
+            "capture_prepare_memory_synchronous"
+        },
+        &mut phase,
+    );
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
     log_phase(name, "capture_disks_and_resume", &mut phase);
@@ -771,6 +781,7 @@ pub fn capture_to_path(
             .take(4096)
             .read_to_string(&mut reply)
             .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
+        tracing::info!(machine = name, command = "FINISH_SAVE_STREAM", reply = ?reply.trim(), "checkpoint memory protocol reply");
         if !reply.starts_with("OK saved (") {
             return Err(Error::agent("complete checkpoint stream", reply));
         }
@@ -783,6 +794,7 @@ pub fn capture_to_path(
                 &format!("FINISH_SAVE {}", runtime_snapshot.display()),
                 std::time::Duration::from_secs(30 * 60),
             )?;
+            tracing::info!(machine = name, command = "FINISH_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
             if !reply.starts_with("OK") {
                 return Err(Error::agent("finish checkpoint", reply));
             }
