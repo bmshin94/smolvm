@@ -196,6 +196,7 @@ pub struct Packer {
     stub_path: Option<std::path::PathBuf>,
     manifest: PackManifest,
     asset_collector: Option<AssetCollector>,
+    direct_artifact_io: bool,
 }
 
 /// Error type for try_pack_embedded_macho (internal).
@@ -214,7 +215,15 @@ impl Packer {
             stub_path: None,
             manifest,
             asset_collector: None,
+            direct_artifact_io: false,
         }
+    }
+
+    /// Prefer bounded direct writes for bulk artifacts on Linux; other hosts
+    /// and unsupported filesystems retain buffered writes and final syncing.
+    pub fn with_direct_artifact_io(mut self) -> Self {
+        self.direct_artifact_io = true;
+        self
     }
 
     /// Set the path to the stub executable.
@@ -365,7 +374,10 @@ impl Packer {
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let temp_path = temp.into_temp_path();
         let artifact = ChecksummedWriter::new(DigestWriter {
-            inner: File::create(&temp_path)?,
+            inner: crate::artifact_writer::ArtifactWriter::create(
+                &temp_path,
+                self.direct_artifact_io,
+            )?,
             sha256: compute_digest.then(DigestWorker::spawn).transpose()?,
             digest_error: None,
         });
@@ -395,9 +407,9 @@ impl Packer {
         };
         artifact.write_all(&footer.to_bytes())?;
         artifact.flush()?;
-        artifact.inner.sync_all()?;
+        let file = artifact.inner.finish()?;
+        file.sync_all()?;
         let digest = artifact.sha256.map(DigestWorker::finish).transpose()?;
-        let file = artifact.inner;
 
         temp_path
             .persist_noclobber(output)
@@ -1274,6 +1286,30 @@ mod tests {
         };
         assert!(digest.update(b"bytes").is_err());
         assert!(digest.finish().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_artifact_keeps_exact_footer_checksum_and_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("direct.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (info, identity) = Packer::new(manifest)
+            .with_direct_artifact_io()
+            .pack_artifact_with_identity(&output)
+            .unwrap();
+        let bytes = fs::read(&output).unwrap();
+        assert_eq!(info.total_size, bytes.len() as u64);
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(identity.digest_for(&output), Some(expected.as_str()));
+        assert!(
+            verify_sidecar_checksum(&output, &read_footer_from_sidecar(&output).unwrap()).unwrap()
+        );
     }
 
     #[cfg(unix)]

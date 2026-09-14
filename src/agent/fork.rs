@@ -1487,7 +1487,7 @@ fn reconcile_fork_lineage_memory_limit(
 /// the source's persistent private-over-memfd backing, then reconcile it on
 /// drop after success or rollback.
 #[cfg(target_os = "linux")]
-struct ForkLineageMemoryReservation {
+pub(crate) struct ForkLineageMemoryReservation {
     golden: String,
     record: VmRecord,
     snapshot_dir: PathBuf,
@@ -1498,6 +1498,36 @@ struct ForkLineageMemoryReservation {
 
 #[cfg(target_os = "linux")]
 impl ForkLineageMemoryReservation {
+    /// Caller must hold the source lock until the memory worker has finished
+    /// or been cancelled; otherwise another operation could resize this scope.
+    pub(crate) fn checkpoint(golden: &str, snapshot_dir: &Path) -> Result<Self> {
+        let db = SmolvmDb::open()?;
+        let record = db
+            .get_vm(golden)?
+            .ok_or_else(|| Error::vm_not_found(golden))?;
+        let retained = db.retained_fork_snapshot(golden)?;
+        let generations = referenced_fork_generation_count(
+            &db,
+            golden,
+            &vm_data_dir(golden).join("s"),
+            retained.as_ref(),
+        )?;
+        Self::reserve(golden, &record, snapshot_dir, generations)
+    }
+
+    pub(crate) fn checkpoint_prepared(&mut self) -> Result<()> {
+        self.mark_source_rebased();
+        let db = SmolvmDb::open()?;
+        let identity = self.record.pid_start_time;
+        db.update_vm(&self.golden, |record| {
+            // Do not carry an allowance into a replacement VMM.
+            if record.pid == self.record.pid && record.pid_start_time == identity {
+                record.fork_lineage_pid_start_time = identity;
+            }
+        })?;
+        Ok(())
+    }
+
     fn reserve(
         golden: &str,
         record: &VmRecord,
@@ -1950,6 +1980,7 @@ pub(crate) fn prepare_forks_reusing(
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
 ) -> Result<PreparedForkBatch> {
+    let preparation_started = std::time::Instant::now();
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
@@ -2036,6 +2067,7 @@ pub(crate) fn prepare_forks_reusing(
         ));
     }
     let golden_was_paused = fork_base_already_paused(&status);
+    tracing::info!(%golden, phase = "source_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
     let fork_continue = fork_continue_enabled();
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
@@ -2143,6 +2175,7 @@ pub(crate) fn prepare_forks_reusing(
             let _ = std::fs::remove_dir_all(&snapshot_dir);
             return Err(error);
         }
+        tracing::info!(%golden, phase = "guest_synced", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
 
         let forkpoint_armed = match arm_forkpoint_for_capture(golden) {
             Ok(armed) => armed,
@@ -2167,6 +2200,7 @@ pub(crate) fn prepare_forks_reusing(
             }
         }
 
+        tracing::info!(%golden, phase = "disk_generation_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
         #[cfg(target_os = "linux")]
         let mut lineage_memory_reservation = if fork_continue {
             let reservation =
@@ -2197,6 +2231,7 @@ pub(crate) fn prepare_forks_reusing(
         };
 
         let t_snap = std::time::Instant::now();
+        tracing::info!(%golden, phase = "memory_reserved", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
         // Active children map one sparse materialized memfd generation so CPU-
         // and I/O-heavy work never serializes behind page-by-page delivery.
         // Held pool slots use the same shared generation because they may run a

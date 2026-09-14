@@ -177,6 +177,62 @@ pub(crate) fn prepare_memory_backend(snapshot: &Path, branchable: bool) -> Resul
     }
 }
 
+// FINISH_SAVE consumes and closes its output file before replying. Only use
+// this handoff after that reply, under the source lock. Taking ownership of the
+// inode prevents the isolated VMM uid from reopening it after publication.
+#[cfg(target_os = "linux")]
+fn link_completed_memory(source: &Path, staged: &Path) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(false);
+    }
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(Error::agent(
+            "stage checkpoint RAM",
+            "memory image is not a regular file",
+        ));
+    }
+    if before.nlink() != 1 {
+        return Ok(false);
+    }
+    match std::fs::hard_link(source, staged) {
+        Ok(()) => {}
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EXDEV | libc::EOPNOTSUPP)) => {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let result = (|| -> std::io::Result<()> {
+        let linked = std::fs::symlink_metadata(staged)?;
+        if (linked.dev(), linked.ino()) != (before.dev(), before.ino()) {
+            return Err(std::io::Error::other(
+                "checkpoint RAM identity changed during staging",
+            ));
+        }
+        if unsafe { libc::fchown(file.as_raw_fd(), 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(staged);
+        return Err(error.into());
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
+    Ok(false)
+}
+
 pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
     tracing::info!(
         machine = name,
@@ -711,6 +767,17 @@ pub fn capture_to_path(
     output: &Path,
     options: &CaptureOptions,
 ) -> Result<CaptureResult> {
+    capture_to_path_with_source_release(name, output, options, || {})
+}
+
+/// Release API lifecycle ownership only after all input state belongs to this
+/// capture. The closure also owns the guard on errors or client disconnects.
+pub(crate) fn capture_to_path_with_source_release(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    release_source: impl FnOnce(),
+) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
     if options.store_dir.is_some() && options.staging_dir.is_some() {
@@ -822,8 +889,8 @@ pub fn capture_to_path(
     // A serve process has its own lifecycle mutex, but another CLI process
     // does not share it. Use the same source lock as `machine fork` so SAVE and
     // fork can never overlap or produce two competing source generations.
-    // Release it as soon as the source resumes; hashing and compression do not
-    // touch the live machine and must not delay a subsequent fork.
+    // Hold it through the RAM worker: its cgroup reservation must not race a
+    // fork resizing the same scope. Release before packaging and compression.
     let source_lock = crate::agent::fork::lock_fork_source(name)?;
     let config = validated_capture_source(name)?;
     let vm = config
@@ -833,6 +900,9 @@ pub fn capture_to_path(
     let control = crate::agent::fork::control_socket_path(name);
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
+    #[cfg(target_os = "linux")]
+    let mut memory_reservation =
+        crate::agent::fork::ForkLineageMemoryReservation::checkpoint(name, &runtime_snapshot)?;
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     let snapshot_dir = staging_dir.join(ASSET_DIR);
@@ -843,6 +913,7 @@ pub fn capture_to_path(
         std::time::Duration::from_secs(30 * 60),
     )?;
     let prepared = reply.starts_with("OK");
+    tracing::info!(machine = name, command = "PREPARE_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     if !prepared
         && options.store_dir.is_none()
         && (reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command")
@@ -852,6 +923,7 @@ pub fn capture_to_path(
             &format!("SAVE {}", runtime_snapshot.display()),
             std::time::Duration::from_secs(30 * 60),
         )?;
+        tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
     if !reply.starts_with("OK") {
         return Err(Error::agent(
@@ -864,12 +936,23 @@ pub fn capture_to_path(
         prepared_save: prepared.then(|| runtime_snapshot.clone()),
         armed: true,
     };
-    log_phase(name, "capture_prepare_memory", &mut phase);
+    #[cfg(target_os = "linux")]
+    if prepared {
+        memory_reservation.checkpoint_prepared()?;
+    }
+    log_phase(
+        name,
+        if prepared {
+            "capture_prepare_memory_deferred"
+        } else {
+            "capture_prepare_memory_synchronous"
+        },
+        &mut phase,
+    );
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
     log_phase(name, "capture_disks_and_resume", &mut phase);
     let source_pause = pause_started.elapsed();
-    drop(source_lock);
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -888,6 +971,7 @@ pub fn capture_to_path(
             .take(4096)
             .read_to_string(&mut reply)
             .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
+        tracing::info!(machine = name, command = "FINISH_SAVE_STREAM", reply = ?reply.trim(), "checkpoint memory protocol reply");
         if !reply.starts_with("OK saved (") {
             return Err(Error::agent("complete checkpoint stream", reply));
         }
@@ -900,6 +984,7 @@ pub fn capture_to_path(
                 &format!("FINISH_SAVE {}", runtime_snapshot.display()),
                 std::time::Duration::from_secs(30 * 60),
             )?;
+            tracing::info!(machine = name, command = "FINISH_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
             if !reply.starts_with("OK") {
                 return Err(Error::agent("finish checkpoint", reply));
             }
@@ -908,9 +993,17 @@ pub fn capture_to_path(
         None
     };
     log_phase(name, "capture_finish_memory", &mut phase);
+    #[cfg(target_os = "linux")]
+    drop(memory_reservation);
     // Export sparse files after resume; streamed RAM is already in the store.
     for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
         if file == "memory.bin" && stored_memory.is_some() {
+            continue;
+        }
+        if file == "memory.bin"
+            && prepared
+            && link_completed_memory(&runtime_snapshot.join(file), &snapshot_dir.join(file))?
+        {
             continue;
         }
         crate::disk_utils::clone_or_copy_file(
@@ -993,6 +1086,10 @@ pub fn capture_to_path(
     });
     manifest.assets = collector.into_inventory();
     log_phase(name, "capture_manifest", &mut phase);
+    // Everything consumed below is capture-owned. Packaging and publication
+    // must not serialize new branches or other operations on the live source.
+    drop(source_lock);
+    release_source();
 
     if let Some((directory, mut writer)) = stored {
         let mut files = writer
@@ -1026,7 +1123,9 @@ pub fn capture_to_path(
 
     let collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
-    let packer = Packer::new(manifest).with_asset_collector(collector);
+    let packer = Packer::new(manifest)
+        .with_asset_collector(collector)
+        .with_direct_artifact_io();
     let retain = cfg!(target_os = "linux")
         && options
             .prepared_cache_budget_bytes
@@ -2435,6 +2534,61 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_memory_staging_preserves_owned_inode_after_source_removal() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("runtime-memory");
+        let staged = dir.path().join("staged-memory");
+        std::fs::write(&source, b"captured RAM").unwrap();
+        let linked = link_completed_memory(&source, &staged).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!linked);
+            assert!(!staged.exists());
+            return;
+        }
+        assert!(linked);
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged).unwrap().ino()
+        );
+        let metadata = std::fs::metadata(&staged).unwrap();
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        std::fs::remove_file(source).unwrap();
+        assert_eq!(std::fs::read(staged).unwrap(), b"captured RAM");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_memory_staging_declines_preexisting_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"RAM").unwrap();
+        std::fs::hard_link(&source, dir.path().join("alias")).unwrap();
+        let staged = dir.path().join("staged");
+        assert!(!link_completed_memory(&source, &staged).unwrap());
+        assert!(!staged.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_memory_staging_never_clobbers_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let staged = dir.path().join("staged");
+        std::fs::write(&source, b"RAM").unwrap();
+        std::fs::write(&staged, b"existing").unwrap();
+        let result = link_completed_memory(&source, &staged);
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_err());
+        } else {
+            assert!(!result.unwrap());
+        }
+        assert_eq!(std::fs::read(staged).unwrap(), b"existing");
+    }
 
     fn packed_sidecar(dir: &Path, name: &str, tag: &str) -> PathBuf {
         let artifact = dir.join(name);
