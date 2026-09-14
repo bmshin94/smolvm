@@ -2124,11 +2124,7 @@ pub(crate) fn prepare_forks_reusing(
             .transpose()
             .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?
             .ok_or_else(|| Error::agent("create snapshot dir", "could not allocate a unique id"))?;
-        let uid_owner = golden_rec
-            .fork_overlay_owner
-            .as_deref()
-            .or(golden_rec.golden.as_deref())
-            .unwrap_or(golden);
+        let uid_owner = golden_rec.vm_uid_owner().unwrap_or(golden);
         let uid_owner_dir = vm_data_dir(uid_owner);
         let vm_ids = crate::process::vm_drop_ids(
             &crate::agent::vm_uid_registry_dir(),

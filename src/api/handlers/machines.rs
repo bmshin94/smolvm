@@ -1230,6 +1230,7 @@ pub async fn create_machine(
             .as_ref()
             .and_then(|checkpoint| checkpoint.workload.as_ref())
             .map(|workload| workload.overlay_owner.clone()),
+        host_uid_owner: manifest_checkpoint.as_ref().map(|_| name.clone()),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
         // refs win on key collision. Both sources are store-only, so RecordReplay
@@ -1613,7 +1614,7 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
-    let record_fork_overlay_owner = record.fork_overlay_owner.clone();
+    let record_fork_overlay_owner = record.vm_uid_owner().map(str::to_string);
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
@@ -2278,11 +2279,7 @@ async fn boot_prepared_fork_inner(
         features.snapshot_dir = Some(prep.snapshot_dir);
         // A nested branch must keep the original lineage's UID, not allocate
         // a new UID from the immediate parent's snapshot directory.
-        features.uid_share_dir = record
-            .fork_overlay_owner
-            .as_deref()
-            .or(record.golden.as_deref())
-            .map(crate::agent::vm_data_dir);
+        features.uid_share_dir = record.vm_uid_owner().map(crate::agent::vm_data_dir);
         features.cuda_share_weights = share_weights;
         features.cuda_preload_modules = record.cuda_preload_modules;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;

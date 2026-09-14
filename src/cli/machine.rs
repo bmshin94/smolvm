@@ -3881,6 +3881,7 @@ impl CreateCmd {
 
         let mut record = vm_common::build_vm_record(&params)?;
         if checkpoint.is_some() {
+            record.host_uid_owner = Some(record.name.clone());
             // The restored RAM already contains the initialized guest and its
             // running workload. Re-running image pull/init after resume would
             // duplicate side effects and violate checkpoint semantics.

@@ -589,6 +589,15 @@ fn safe_unpack_with_limits<R: Read>(
     dest: &Path,
     limits: &SafeUnpackLimits,
 ) -> std::io::Result<UnpackReport> {
+    safe_unpack_with_policy(archive, dest, limits, false)
+}
+
+fn safe_unpack_with_policy<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    limits: &SafeUnpackLimits,
+    checkpoint: bool,
+) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
@@ -628,6 +637,19 @@ fn safe_unpack_with_limits<R: Read>(
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
+        // RAM is a host runtime input, not a guest filesystem entry. Never
+        // restore the exporting VMM's UID onto this shared cache object.
+        let host_memory =
+            checkpoint && normalize_path(&entry_path) == Path::new("checkpoint/memory.bin");
+        if host_memory
+            && entry_type != tar::EntryType::Regular
+            && entry_type != tar::EntryType::GNUSparse
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint RAM must be a regular file",
+            ));
+        }
 
         // Enforce the entry-count and total-bytes ceilings (Fix 3): reject an
         // archive that would flood inodes or exhaust disk before we write it.
@@ -804,8 +826,16 @@ fn safe_unpack_with_limits<R: Read>(
         // Read the owner off the header before the entry is consumed: the
         // sparse path streams `entry` to exhaustion, after which the header is
         // still available but reading it here keeps both branches symmetric.
-        let uid = entry.header().uid().unwrap_or(0);
-        let gid = entry.header().gid().unwrap_or(0);
+        let uid = if host_memory {
+            0
+        } else {
+            entry.header().uid().unwrap_or(0)
+        };
+        let gid = if host_memory {
+            0
+        } else {
+            entry.header().gid().unwrap_or(0)
+        };
 
         // GNU sparse entries already carry an exact extent map. Let the tar
         // reader seek over those holes directly instead of expanding them and
@@ -870,6 +900,9 @@ fn safe_unpack_with_limits<R: Read>(
             // and the deferred directory pass below only restores modes, never
             // owners, so doing it here is the single point that applies.
             set_owner(&full_path, uid, gid);
+        }
+        if host_memory {
+            set_mode(&full_path, 0o600);
         }
         report.entries += 1;
     }
@@ -1633,7 +1666,15 @@ fn extract_sidecar_inner(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let mut archive = tar::Archive::new(decoder);
-    safe_unpack(&mut archive, cache_dir)?;
+    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
+    safe_unpack_with_policy(
+        &mut archive,
+        cache_dir,
+        &SafeUnpackLimits::from_env(),
+        manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.checkpoint.is_some()),
+    )?;
 
     if debug {
         eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -1641,7 +1682,6 @@ fn extract_sidecar_inner(
 
     // A sidecar can be any age while the smolvm running it is current, so its
     // manifest is the only thing that says what the agent inside can do.
-    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
 
     // Layer order from the sidecar manifest (bottom→top). Best-effort: if the
     // manifest can't be read the agent falls back to a name sort.
@@ -3420,6 +3460,40 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
         // The symlink target must not be modified
         assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_ram_is_host_owned_but_guest_files_keep_their_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let mut builder = tar::Builder::new(Vec::new());
+        for path in ["checkpoint/memory.bin", "pgdata"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o666);
+            header.set_uid(999);
+            header.set_gid(999);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, &b"data"[..])
+                .unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            dir.path(),
+            &SafeUnpackLimits::from_env(),
+            true,
+        )
+        .unwrap();
+        let ram = fs::metadata(dir.path().join("checkpoint/memory.bin")).unwrap();
+        let guest = fs::metadata(dir.path().join("pgdata")).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(ram.uid(), uid);
+        assert_eq!(ram.mode() & 0o777, 0o600);
+        assert_eq!(guest.uid(), if uid == 0 { 999 } else { uid });
     }
 
     /// Container images address their service accounts numerically — postgres

@@ -205,6 +205,8 @@ pub struct MachineRegistration {
     pub user: Option<String>,
     /// Persistent overlay identifier inherited by a restored image workload.
     pub fork_overlay_owner: Option<String>,
+    /// Local UID lineage established by a portable restore.
+    pub host_uid_owner: Option<String>,
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
@@ -1056,6 +1058,7 @@ impl ApiState {
         record.workdir = reg.workdir;
         record.user = reg.user;
         record.fork_overlay_owner = reg.fork_overlay_owner;
+        record.host_uid_owner = reg.host_uid_owner;
         record.secret_refs = reg.secret_refs.clone();
         record.remote_volumes = reg.remote_volumes.clone();
         record

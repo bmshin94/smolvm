@@ -207,11 +207,7 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     // (re)start — where no snapshot path exists to infer it — can still open
     // the golden's copy-on-write disk backing behind its 0700 data dir.
     if features.uid_share_dir.is_none() {
-        if let Some(g) = record
-            .fork_overlay_owner
-            .as_deref()
-            .or(record.golden.as_deref())
-        {
+        if let Some(g) = record.vm_uid_owner() {
             features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
         }
     }

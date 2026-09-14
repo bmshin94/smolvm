@@ -177,6 +177,31 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // which now point to /dev/null.
     crate::process::close_inherited_fds_from(3);
 
+    // Never accept an inherited descriptor number from the launching environment.
+    std::env::remove_var("SMOLVM_READONLY_RESTORE_FD");
+    #[cfg(target_os = "linux")]
+    if let Some(snapshot) = std::env::var_os("SMOLVM_SNAPSHOT_DIR").map(PathBuf::from) {
+        if crate::portable_checkpoint::has_readonly_memory(&snapshot) {
+            use std::os::fd::IntoRawFd;
+            if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1") {
+                return Err(crate::Error::agent(
+                    "prepare restore RAM",
+                    "read-only input requires branchable restore",
+                ));
+            }
+            let vm_dir = config.storage_disk_path.parent().ok_or_else(|| {
+                crate::Error::agent("prepare restore RAM", "missing VM directory")
+            })?;
+            let input = crate::portable_checkpoint::open_readonly_memory(vm_dir)?;
+            // The launcher consumes this descriptor; all error paths exit this
+            // dedicated boot process, and libkrun keeps its own duplicate.
+            std::env::set_var(
+                "SMOLVM_READONLY_RESTORE_FD",
+                input.into_raw_fd().to_string(),
+            );
+        }
+    }
+
     // Defense-in-depth before this process becomes the VMM host for an untrusted
     // guest: block setuid privilege escalation and core dumps (which would leak
     // guest RAM). See docs/runtime-isolation-hardening.md for the full roadmap.

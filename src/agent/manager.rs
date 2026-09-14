@@ -2060,6 +2060,10 @@ impl AgentManager {
             }
         }
 
+        if let Some(snapshot) = features.snapshot_dir.as_deref() {
+            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
+        }
+
         // A privileged node drops each VMM to a distinct uid. Start the shared
         // CUDA daemon while this manager still has access to the node data dir;
         // the isolated VMM then only needs permission to connect to its socket.
@@ -2288,8 +2292,13 @@ impl AgentManager {
                         e.to_string(),
                     )
                 })?;
-                crate::process::chown_tree(d, uid, gid)
-                    .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
+                crate::process::chown_tree_except(
+                    d,
+                    uid,
+                    gid,
+                    Some(&d.join(crate::portable_checkpoint::READONLY_INPUT_DIR)),
+                )
+                .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
                 #[cfg(target_os = "linux")]
                 {
                     use std::os::unix::fs::PermissionsExt;

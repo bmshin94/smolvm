@@ -32,6 +32,150 @@ pub const ASSET_DIR: &str = "checkpoint";
 const INSTALLED_DIR: &str = "portable-checkpoint";
 const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
+pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
+const READONLY_INPUT_MARKER: &str = "readonly-memory";
+
+fn readonly_restore_supported() -> bool {
+    if !cfg!(target_os = "linux")
+        || !crate::process::vm_uid_drop_active()
+        || std::env::var_os("SMOLVM_DISABLE_READONLY_RESTORE").is_some()
+    {
+        return false;
+    }
+    crate::agent::find_lib_dir()
+        .and_then(|dir| {
+            // The same runtime discovery used by the launcher; old libraries retain
+            // the ordinary private-copy installation path.
+            unsafe { crate::agent::KrunFunctions::load(&dir) }.ok()
+        })
+        .is_some_and(|krun| krun.set_snapshot_memory_fd.is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !asset.sha256.is_empty() || !readonly_restore_supported() {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !metadata.is_file() || metadata.len() != asset.size {
+        return Err(Error::agent(
+            "retain restore RAM",
+            "RAM image type or size mismatch",
+        ));
+    }
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Ok(false);
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".restore-input-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(vm_dir)?;
+    let input = staging.path().join("memory.bin");
+    match std::fs::hard_link(source, &input) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    // Durability still matters: the retained image must survive a service/host
+    // restart between import and start. Subsequent cache hits sync clean pages.
+    std::fs::File::open(&input)?.sync_all()?;
+    std::fs::File::open(staging.path())?.sync_all()?;
+    let destination = vm_dir.join(READONLY_INPUT_DIR);
+    if destination.exists() {
+        return Err(Error::agent("retain restore RAM", "input already exists"));
+    }
+    std::fs::rename(staging.path(), &destination)?;
+    std::fs::File::open(vm_dir)?.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stage_readonly_memory(_: &Path, _: &Path, _: &CheckpointAsset) -> Result<bool> {
+    Ok(false)
+}
+
+/// Open a retained RAM image while the boot process still has service privileges.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_readonly_memory(vm_dir: &Path) -> Result<std::fs::File> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(vm_dir.join(READONLY_INPUT_DIR))?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != 0 || metadata.mode() & 0o777 != 0o700 {
+        return Err(Error::agent(
+            "open restore RAM",
+            "input directory must be service-owned mode 0700",
+        ));
+    }
+    // Anchor the lookup to the validated directory and never follow a symlink.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"memory.bin".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(Error::agent(
+            "open restore RAM",
+            "input must be a protected regular file",
+        ));
+    }
+    Ok(file)
+}
+
+pub(crate) fn has_readonly_memory(snapshot: &Path) -> bool {
+    snapshot.join(READONLY_INPUT_MARKER).is_file()
+}
+
+/// Downgrading the runtime or explicitly requesting a leaf restore remains safe.
+pub(crate) fn prepare_memory_backend(snapshot: &Path, branchable: bool) -> Result<()> {
+    if !has_readonly_memory(snapshot) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if branchable && readonly_restore_supported() {
+            return Ok(());
+        }
+        let vm_dir = snapshot
+            .parent()
+            .ok_or_else(|| Error::agent("prepare restore RAM", "missing VM directory"))?;
+        let input = open_readonly_memory(vm_dir)?;
+        use std::os::fd::AsRawFd;
+        // Copy from the checked descriptor, not a second unvalidated path lookup.
+        crate::disk_utils::clone_or_copy_file(
+            Path::new(&format!("/proc/self/fd/{}", input.as_raw_fd())),
+            &snapshot.join("memory.bin"),
+        )?;
+        std::fs::File::open(snapshot.join("memory.bin"))?.sync_all()?;
+        std::fs::File::open(snapshot)?.sync_all()?;
+        std::fs::remove_file(snapshot.join(READONLY_INPUT_MARKER))?;
+        std::fs::File::open(snapshot)?.sync_all()?;
+        std::fs::remove_dir_all(vm_dir.join(READONLY_INPUT_DIR))?;
+        std::fs::File::open(vm_dir)?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = branchable;
+        Err(Error::agent(
+            "prepare restore RAM",
+            "read-only input is Linux-only",
+        ))
+    }
+}
 
 pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
     tracing::info!(
@@ -285,6 +429,7 @@ fn restored_record(
     // image pull/init on its first start would duplicate side effects.
     record.init_completed = true;
     record.forkable = true;
+    record.host_uid_owner = Some(name.to_string());
     Ok(record)
 }
 
@@ -346,11 +491,7 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
 // same lineage UID. Never grant the VMM access to service-owned pack libraries.
 fn runtime_capture_dir(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
     let data = crate::agent::vm_data_dir(name);
-    let owner = vm
-        .fork_overlay_owner
-        .as_deref()
-        .or(vm.golden.as_deref())
-        .unwrap_or(name);
+    let owner = vm.vm_uid_owner().unwrap_or(name);
     let owner_data = crate::agent::vm_data_dir(owner);
     let ids = crate::process::vm_drop_ids(
         &crate::agent::vm_uid_registry_dir(),
@@ -1871,6 +2012,12 @@ pub fn install(
             let filename = Path::new(expected)
                 .file_name()
                 .expect("fixed checkpoint asset path");
+            if expected == "checkpoint/memory.bin"
+                && stage_readonly_memory(&extracted.join(expected), vm_data_dir, asset)?
+            {
+                std::fs::write(partial.join(READONLY_INPUT_MARKER), b"1\n")?;
+                continue;
+            }
             copy_verified(
                 &extracted.join(expected),
                 &partial.join(filename),
@@ -1954,6 +2101,7 @@ pub fn install(
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&partial);
         let _ = std::fs::remove_dir_all(&destination);
+        let _ = std::fs::remove_dir_all(vm_data_dir.join(READONLY_INPUT_DIR));
     }
     result
 }
@@ -1996,7 +2144,7 @@ pub fn pending_dir(vm_data_dir: &Path) -> Option<PathBuf> {
     let marker = dir.join(PENDING_MARKER);
     if marker.is_file()
         && dir.join("checkpoint.bin").is_file()
-        && dir.join("memory.bin").is_file()
+        && (dir.join("memory.bin").is_file() || has_readonly_memory(&dir))
         && dir.join("manifest.bin").is_file()
     {
         Some(dir)
@@ -2016,7 +2164,8 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
         return Ok(());
     };
     let mut retained_memory = None;
-    if retain_memory {
+    let readonly_input = has_readonly_memory(&dir);
+    if retain_memory && !readonly_input {
         let source = dir.join("memory.bin");
         let destination = vm_data_dir.join(RETAINED_MEMORY_BACKING);
         if destination.exists() {
@@ -2045,6 +2194,11 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
         }
         Error::agent("consume checkpoint", error.to_string())
     })?;
+    if readonly_input {
+        if let Err(error) = std::fs::remove_dir_all(vm_data_dir.join(READONLY_INPUT_DIR)) {
+            tracing::warn!(%error, "checkpoint consumed but retained RAM cleanup failed");
+        }
+    }
     if let Err(error) = std::fs::remove_dir_all(&dir) {
         tracing::warn!(path = %dir.display(), %error, "checkpoint consumed but payload cleanup failed");
     }
@@ -2054,6 +2208,89 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readonly_restore_consumption_preserves_shared_input() {
+        let machine = tempfile::tempdir().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"checkpoint RAM").unwrap();
+        let snapshot = machine.path().join(INSTALLED_DIR);
+        std::fs::create_dir(&snapshot).unwrap();
+        for name in [
+            PENDING_MARKER,
+            READONLY_INPUT_MARKER,
+            "checkpoint.bin",
+            "manifest.bin",
+        ] {
+            std::fs::write(snapshot.join(name), b"").unwrap();
+        }
+        let retained = machine.path().join(READONLY_INPUT_DIR);
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::hard_link(source.path(), retained.join("memory.bin")).unwrap();
+        assert_eq!(pending_dir(machine.path()), Some(snapshot));
+        consume_with_retained_backing(machine.path(), false).unwrap();
+        assert!(pending_dir(machine.path()).is_none());
+        assert!(!retained.exists());
+        assert_eq!(std::fs::read(source.path()).unwrap(), b"checkpoint RAM");
+        consume_with_retained_backing(machine.path(), false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readonly_restore_rejects_directory_symlink() {
+        let machine = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), machine.path().join(READONLY_INPUT_DIR)).unwrap();
+        assert!(open_readonly_memory(machine.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readonly_restore_rejects_unprotected_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let machine = tempfile::tempdir().unwrap();
+        let retained = machine.path().join(READONLY_INPUT_DIR);
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::set_permissions(&retained, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(retained.join("memory.bin"), b"RAM").unwrap();
+        assert!(open_readonly_memory(machine.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root for per-VM ownership validation"]
+    fn readonly_restore_root_isolation_and_fallback() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, PermissionsExt},
+        };
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let machine = tempfile::tempdir().unwrap();
+        let retained = machine.path().join(READONLY_INPUT_DIR);
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::set_permissions(&retained, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"immutable RAM").unwrap();
+        let input = retained.join("memory.bin");
+        std::fs::hard_link(source.path(), &input).unwrap();
+        crate::process::chown_tree_except(machine.path(), 2000000, 2000000, Some(&retained))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&retained).unwrap().uid(), 0);
+        assert_eq!(std::fs::metadata(&input).unwrap().uid(), 0);
+        let opened = open_readonly_memory(machine.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+            libc::O_RDONLY
+        );
+        let snapshot = machine.path().join(INSTALLED_DIR);
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(snapshot.join(READONLY_INPUT_MARKER), b"").unwrap();
+        prepare_memory_backend(&snapshot, false).unwrap();
+        assert!(!has_readonly_memory(&snapshot));
+        assert!(!retained.exists());
+        std::fs::write(snapshot.join("memory.bin"), b"private RAM").unwrap();
+        assert_eq!(std::fs::read(source.path()).unwrap(), b"immutable RAM");
+    }
 
     #[test]
     fn restore_checks_sidecar_checksum_before_manifest_or_machine_creation() {
@@ -2196,6 +2433,33 @@ mod tests {
             std::fs::read(machine.path().join("storage.raw")).unwrap(),
             b"storage-disk"
         );
+
+        let mut remote = metadata.clone();
+        let mut source_record = VmRecord::new(
+            "remote-source".into(),
+            2,
+            512,
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        source_record.image = Some("alpine:3.20".into());
+        remote.workload = checkpoint_workload(&source_record.name, &source_record);
+        let manifest = PackManifest::new(
+            "vm://remote-source".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let restored = restored_record("local-restore", &manifest, &remote).unwrap();
+        assert_eq!(
+            restored.fork_overlay_owner.as_deref(),
+            Some("remote-source")
+        );
+        assert_eq!(restored.vm_uid_owner(), Some("local-restore"));
+        let roundtrip: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
+        assert_eq!(roundtrip.vm_uid_owner(), Some("local-restore"));
 
         let mut oversized = metadata.clone();
         oversized.memory.size =

@@ -1663,11 +1663,7 @@ fn start_vm_named_with_db(
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.
-        uid_share_dir: record
-            .fork_overlay_owner
-            .as_deref()
-            .or(record.golden.as_deref())
-            .map(smolvm::agent::vm_data_dir),
+        uid_share_dir: record.vm_uid_owner().map(smolvm::agent::vm_data_dir),
         ..Default::default()
     }
     .with_packed_layers(

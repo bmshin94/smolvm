@@ -1420,6 +1420,19 @@ pub fn ensure_traversable(_dir: &std::path::Path) {}
 /// its VMM will drop to. Linux-only; the caller is root.
 #[cfg(target_os = "linux")]
 pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    chown_tree_except(path, uid, gid, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn chown_tree_except(
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    excluded: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    if excluded == Some(path) {
+        return Ok(());
+    }
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -1430,7 +1443,7 @@ pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_dir() {
         for entry in std::fs::read_dir(path)? {
-            chown_tree(&entry?.path(), uid, gid)?;
+            chown_tree_except(&entry?.path(), uid, gid, excluded)?;
         }
     }
     Ok(())
@@ -1439,6 +1452,16 @@ pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result
 /// No-op where chown isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
 pub fn chown_tree(_path: &std::path::Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn chown_tree_except(
+    _: &std::path::Path,
+    _: u32,
+    _: u32,
+    _: Option<&std::path::Path>,
+) -> std::io::Result<()> {
     Ok(())
 }
 
