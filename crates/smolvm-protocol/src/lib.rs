@@ -84,6 +84,9 @@ pub mod base64_bytes {
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The agent can freeze internal filesystems before acknowledging shutdown.
+pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
+
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
 /// guest agent's `mount -t virtiofs` source can't drift apart.

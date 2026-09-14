@@ -52,7 +52,7 @@ fn respond_with_interval(
     let response = match result {
         Ok(()) => AgentResponse::ok(Some(serde_json::json!({
             "shutdown": true,
-            "filesystems_quiesced": progress,
+            "filesystems_quiesced": true,
         }))),
         Err(error) => AgentResponse::error(error.to_string(), error_codes::INTERNAL_ERROR),
     };
@@ -86,7 +86,7 @@ mod tests {
         assert!(matches!(
             &decoded[0],
             AgentResponse::Ok { data: Some(data) }
-                if data["filesystems_quiesced"] == false
+                if data["filesystems_quiesced"] == true
         ));
     }
 

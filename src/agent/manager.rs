@@ -2722,18 +2722,15 @@ impl AgentManager {
             connected = connection.is_ok(),
             "shutdown agent connect finished"
         );
-        let shutdown_acked = if let Ok(mut client) = connection {
-            client.shutdown().is_ok()
-        } else {
-            false
-        };
+        let shutdown = connection.and_then(|mut client| client.shutdown());
+        let shutdown_acked = shutdown.is_ok();
 
         // Process identity is not proof that guest writes reached disk. A slow
         // flush must not turn a graceful stop into an unannounced power cut.
         if !shutdown_acked && process::is_alive(pid) {
             return Err(Error::agent(
                 "stop agent",
-                "guest did not confirm filesystem synchronization; left the VM alive for retry",
+                format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
             ));
         }
 

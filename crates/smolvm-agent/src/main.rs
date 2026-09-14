@@ -2201,13 +2201,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                 let _guard = FLUSH
                     .lock()
                     .map_err(|_| std::io::Error::other("storage synchronization lock poisoned"))?;
-                if progress {
-                    shutdown_freeze::freeze_internal_filesystems()
-                } else {
-                    // Legacy clients retain the existing shutdown contract.
-                    sync_and_unmount_storage();
-                    Ok(())
-                }
+                shutdown_freeze::freeze_internal_filesystems()
             })?;
             return Ok(());
         }
@@ -2387,8 +2381,10 @@ fn handle_request(
 
     match request {
         AgentRequest::Ping => {
-            let capabilities =
-                vec![smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()];
+            let capabilities = vec![
+                smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
+                smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+            ];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
                 capabilities,

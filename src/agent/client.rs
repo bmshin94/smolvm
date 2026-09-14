@@ -1668,12 +1668,8 @@ impl AgentClient {
     /// Request agent shutdown.
     ///
     /// Waits for the agent to acknowledge the shutdown request before returning.
-    /// This ensures the agent has called sync() to flush filesystem caches
-    /// before we send SIGTERM to terminate the VM.
-    ///
-    /// The acknowledgment is critical for data integrity - without it, the VM
-    /// may be killed before ext4 journal commits are flushed, causing layer
-    /// corruption on next boot.
+    /// The agent must advertise safe shutdown before receiving a mutating
+    /// request, then confirm internal filesystems are frozen before termination.
     pub fn shutdown(&mut self) -> Result<()> {
         self.shutdown_with_timeouts(
             Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
@@ -1691,6 +1687,18 @@ impl AgentClient {
         let mut deadlines = ShutdownDeadlines::new(started, idle, maximum);
         self.stream.as_socket().set_nonblocking(true)?;
         let result = (|| -> Result<()> {
+            // Old agents remount storage read-only even when their reply cannot
+            // satisfy this contract. Check capability before changing the guest.
+            self.shutdown_send_until(&AgentRequest::Ping, deadlines.next())?;
+            match self.shutdown_response_until(deadlines.next())? {
+                AgentResponse::Pong { capabilities, .. }
+                    if capabilities.iter().any(|c| c == smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY) => {}
+                AgentResponse::Pong { .. } => return Err(Error::agent(
+                    "shutdown capability",
+                    "running guest agent does not support safe shutdown; VM left unchanged; update the guest agent before retrying",
+                )),
+                _ => return Err(Error::agent("shutdown capability", "unexpected ping response")),
+            }
             let data = self.encode_traced(&AgentRequest::Shutdown { progress: true })?;
             let mut sent = 0;
             while sent < data.len() {
@@ -1704,17 +1712,7 @@ impl AgentClient {
                 // One deadline covers the entire frame; partial bytes never
                 // prolong shutdown. Only a complete progress response does.
                 let deadline = deadlines.next();
-                let mut header = [0; 4];
-                self.shutdown_read_until(&mut header, deadline)?;
-                let len = u32::from_be_bytes(header) as usize;
-                if len > MAX_FRAME_SIZE as usize {
-                    return Err(Error::agent("shutdown ack", "response frame too large"));
-                }
-                let mut body = vec![0; len];
-                self.shutdown_read_until(&mut body, deadline)?;
-                match serde_json::from_slice::<AgentResponse>(&body)
-                    .map_err(|error| Error::agent("shutdown ack", error.to_string()))?
-                {
+                match self.shutdown_response_until(deadline)? {
                     AgentResponse::Ok { data }
                         if data
                             .as_ref()
@@ -1766,6 +1764,28 @@ impl AgentClient {
             read += shutdown_io_until(deadline, || self.stream.read(&mut buf[read..]))?;
         }
         Ok(())
+    }
+
+    fn shutdown_send_until(&mut self, request: &AgentRequest, deadline: Instant) -> Result<()> {
+        let data = self.encode_traced(request)?;
+        let mut sent = 0;
+        while sent < data.len() {
+            sent += shutdown_io_until(deadline, || self.stream.write(&data[sent..]))?;
+        }
+        Ok(())
+    }
+
+    fn shutdown_response_until(&mut self, deadline: Instant) -> Result<AgentResponse> {
+        let mut header = [0; 4];
+        self.shutdown_read_until(&mut header, deadline)?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_FRAME_SIZE as usize {
+            return Err(Error::agent("shutdown ack", "response frame too large"));
+        }
+        let mut body = vec![0; len];
+        self.shutdown_read_until(&mut body, deadline)?;
+        serde_json::from_slice(&body)
+            .map_err(|error| Error::agent("shutdown ack", error.to_string()))
     }
 
     // ========================================================================
@@ -3946,6 +3966,51 @@ mod stalled_body_tests {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
+    fn advertise_safe_shutdown(peer: &mut UdsStream) {
+        let mut header = [0; 4];
+        peer.read_exact(&mut header).unwrap();
+        let mut body = vec![0; u32::from_be_bytes(header) as usize];
+        peer.read_exact(&mut body).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ping"));
+        let response = AgentResponse::Pong {
+            version: smolvm_protocol::PROTOCOL_VERSION,
+            capabilities: vec![smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.into()],
+        };
+        let body = serde_json::to_vec(&response).unwrap();
+        peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(&body).unwrap();
+    }
+
+    #[test]
+    fn shutdown_never_mutates_a_legacy_guest() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            peer.read_exact(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request).contains("ping"));
+            let body = serde_json::to_vec(&AgentResponse::Pong {
+                version: smolvm_protocol::PROTOCOL_VERSION,
+                capabilities: vec![],
+            })
+            .unwrap();
+            peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&body).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            assert_eq!(
+                peer.read(&mut header).unwrap(),
+                0,
+                "must close without sending shutdown"
+            );
+        });
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown()
+            .unwrap_err();
+        assert!(error.to_string().contains("VM left unchanged"));
+        server.join().unwrap();
+    }
+
     #[test]
     fn shutdown_progress_extends_idle_but_not_hard_deadline() {
         let start = Instant::now();
@@ -3963,6 +4028,7 @@ mod stalled_body_tests {
     fn shutdown_accepts_progress_then_final_ack() {
         let (client_stream, mut peer) = UdsStream::pair().unwrap();
         let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
             let mut request = [0; 1024];
             assert!(peer.read(&mut request).unwrap() > 0);
             for response in [
@@ -3993,6 +4059,7 @@ mod stalled_body_tests {
     fn shutdown_rejects_legacy_ack_without_quiesce_confirmation() {
         let (client_stream, mut peer) = UdsStream::pair().unwrap();
         let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
             let mut request = [0; 1024];
             assert!(peer.read(&mut request).unwrap() > 0);
             let response = AgentResponse::Ok {
@@ -4013,6 +4080,7 @@ mod stalled_body_tests {
     fn shutdown_returns_flush_error() {
         let (client_stream, mut peer) = UdsStream::pair().unwrap();
         let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
             let mut request = [0; 1024];
             assert!(peer.read(&mut request).unwrap() > 0);
             let body =
@@ -4031,6 +4099,7 @@ mod stalled_body_tests {
     fn shutdown_progress_stream_cannot_extend_absolute_limit() {
         let (client_stream, mut peer) = UdsStream::pair().unwrap();
         let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
             let mut request = [0; 1024];
             assert!(peer.read(&mut request).unwrap() > 0);
             let body = serde_json::to_vec(&AgentResponse::Progress {
@@ -4058,6 +4127,7 @@ mod stalled_body_tests {
         for slow_header in [true, false] {
             let (client_stream, mut peer) = UdsStream::pair().unwrap();
             let server = std::thread::spawn(move || {
+                advertise_safe_shutdown(&mut peer);
                 let mut request = [0; 1024];
                 assert!(peer.read(&mut request).unwrap() > 0);
                 let body = serde_json::to_vec(&AgentResponse::Ok { data: None }).unwrap();
