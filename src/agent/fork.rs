@@ -1487,7 +1487,7 @@ fn reconcile_fork_lineage_memory_limit(
 /// the source's persistent private-over-memfd backing, then reconcile it on
 /// drop after success or rollback.
 #[cfg(target_os = "linux")]
-struct ForkLineageMemoryReservation {
+pub(crate) struct ForkLineageMemoryReservation {
     golden: String,
     record: VmRecord,
     snapshot_dir: PathBuf,
@@ -1498,6 +1498,36 @@ struct ForkLineageMemoryReservation {
 
 #[cfg(target_os = "linux")]
 impl ForkLineageMemoryReservation {
+    /// Caller must hold the source lock until the memory worker has finished
+    /// or been cancelled; otherwise another operation could resize this scope.
+    pub(crate) fn checkpoint(golden: &str, snapshot_dir: &Path) -> Result<Self> {
+        let db = SmolvmDb::open()?;
+        let record = db
+            .get_vm(golden)?
+            .ok_or_else(|| Error::vm_not_found(golden))?;
+        let retained = db.retained_fork_snapshot(golden)?;
+        let generations = referenced_fork_generation_count(
+            &db,
+            golden,
+            &vm_data_dir(golden).join("s"),
+            retained.as_ref(),
+        )?;
+        Self::reserve(golden, &record, snapshot_dir, generations)
+    }
+
+    pub(crate) fn checkpoint_prepared(&mut self) -> Result<()> {
+        self.mark_source_rebased();
+        let db = SmolvmDb::open()?;
+        let identity = self.record.pid_start_time;
+        db.update_vm(&self.golden, |record| {
+            // Do not carry an allowance into a replacement VMM.
+            if record.pid == self.record.pid && record.pid_start_time == identity {
+                record.fork_lineage_pid_start_time = identity;
+            }
+        })?;
+        Ok(())
+    }
+
     fn reserve(
         golden: &str,
         record: &VmRecord,

@@ -709,6 +709,9 @@ pub fn capture_to_path(
     let control = crate::agent::fork::control_socket_path(name);
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
+    #[cfg(target_os = "linux")]
+    let mut memory_reservation =
+        crate::agent::fork::ForkLineageMemoryReservation::checkpoint(name, &runtime_snapshot)?;
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     let snapshot_dir = staging_dir.join(ASSET_DIR);
@@ -740,6 +743,10 @@ pub fn capture_to_path(
         prepared_save: prepared.then(|| runtime_snapshot.clone()),
         armed: true,
     };
+    #[cfg(target_os = "linux")]
+    if prepared {
+        memory_reservation.checkpoint_prepared()?;
+    }
     log_phase(name, "capture_prepare_memory", &mut phase);
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
@@ -784,6 +791,8 @@ pub fn capture_to_path(
         None
     };
     log_phase(name, "capture_finish_memory", &mut phase);
+    #[cfg(target_os = "linux")]
+    drop(memory_reservation);
     // Export sparse files after resume; streamed RAM is already in the store.
     for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
         if file == "memory.bin" && stored_memory.is_some() {
