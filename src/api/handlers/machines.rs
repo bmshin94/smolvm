@@ -264,11 +264,40 @@ fn replace_checkpoint_cache_entry(
     let parent = destination.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent")
     })?;
-    let staging = tempfile::tempdir_in(parent)?;
-    let link = staging.path().join("artifact");
-    std::fs::hard_link(artifact, &link)?;
     let _lock = lock_checkpoint_cache_namespace(parent)?;
-    std::fs::rename(link, destination)
+    link_checkpoint_cache_alias(artifact, destination, true)
+}
+
+fn link_checkpoint_cache_alias(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    replace: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::artifact_cache::link_checkpoint_artifact(source, destination, replace)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if replace {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| std::io::Error::other("cache destination has no parent"))?;
+            let staging = tempfile::tempdir_in(parent)?;
+            let link = staging.path().join("artifact");
+            std::fs::hard_link(source, &link)?;
+            std::fs::rename(link, destination)?;
+        } else {
+            std::fs::hard_link(source, destination)?;
+        }
+        let _ = std::fs::File::options()
+            .append(true)
+            .open(destination)
+            .and_then(|file| {
+                file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
+            });
+        Ok(())
+    }
 }
 
 const CHECKPOINT_CACHE_LOCK: &str = ".checkpoint-cache.lock";
@@ -304,10 +333,15 @@ fn discard_invalid_checkpoint_cache_entry(src: &std::path::Path) -> std::io::Res
 /// Look `key` up; on a hit, hard-link the entry to `artifact` (a fresh path in a
 /// staging directory) and bump its use time. Returns whether `artifact` now
 /// exists. A stale link failure just reports a miss.
-fn checkpoint_cache_take(key: &str, artifact: &std::path::Path) -> bool {
-    let Ok(src) = checkpoint_cache_path(key) else {
-        return false;
-    };
+/// On a hit, the returned verification pins `artifact`'s inode for the rest of
+/// the request so machine creation can reuse it instead of re-reading the
+/// payload (see [`crate::portable_checkpoint::VerifiedSidecar`]).
+struct CachedCheckpoint {
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+}
+
+fn checkpoint_cache_take(key: &str, artifact: &std::path::Path) -> Option<CachedCheckpoint> {
+    let src = checkpoint_cache_path(key).ok()?;
     take_checkpoint_cache_entry(key, &src, artifact)
 }
 
@@ -315,34 +349,79 @@ fn take_checkpoint_cache_entry(
     key: &str,
     src: &std::path::Path,
     artifact: &std::path::Path,
-) -> bool {
+) -> Option<CachedCheckpoint> {
+    take_checkpoint_cache_entry_with_verifier(
+        key,
+        src,
+        artifact,
+        crate::portable_checkpoint::classify_sidecar_verification,
+    )
+}
+
+fn take_checkpoint_cache_entry_with_verifier(
+    key: &str,
+    src: &std::path::Path,
+    artifact: &std::path::Path,
+    verify: impl FnOnce(
+        &std::path::Path,
+    ) -> crate::error::Result<crate::portable_checkpoint::SidecarVerification>,
+) -> Option<CachedCheckpoint> {
     if !src.is_file() {
-        return false;
+        return None;
     }
-    if let Err(error) = std::fs::hard_link(src, artifact) {
+    let link_started = std::time::Instant::now();
+    let linked = (|| -> std::io::Result<()> {
+        let parent = src
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache source has no parent"))?;
+        let _lock = lock_checkpoint_cache_namespace(parent)?;
+        link_checkpoint_cache_alias(src, artifact, false)
+    })();
+    if let Err(error) = linked {
         tracing::warn!(key, error = %error, "cached checkpoint present but could not be linked");
-        return false;
+        return None;
     }
-    if crate::portable_checkpoint::verified_sidecar_footer(artifact).is_err() {
-        tracing::warn!(
-            key,
-            "discarding invalid cached checkpoint; retrying supplied source"
-        );
-        let _ = std::fs::remove_file(artifact);
-        if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
-            tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
+    let link_ms = link_started.elapsed().as_millis() as u64;
+    let verification_started = std::time::Instant::now();
+    // The cache-link operation already recorded access and refreshed any local
+    // provenance before verification captures its final inode identity.
+    match verify(artifact) {
+        Ok(crate::portable_checkpoint::SidecarVerification::Stable(verified)) => {
+            tracing::info!(
+                key,
+                link_ms,
+                verify_ms = verification_started.elapsed().as_millis() as u64,
+                "restored checkpoint from the node-local cache"
+            );
+            Some(CachedCheckpoint {
+                verified: Some(verified),
+            })
         }
-        return false;
+        #[cfg(unix)]
+        Ok(crate::portable_checkpoint::SidecarVerification::ChangedDuringRead) => {
+            // Hard-link publication/cleanup also changes ctime. A successful
+            // checksum with unstable identity is not evidence of bad bytes.
+            // Keep the pinned staging link but hand off no proof: creation
+            // must perform the full verification again before using it.
+            tracing::info!(
+                key,
+                "checkpoint identity changed during verification; requiring fresh verification"
+            );
+            Some(CachedCheckpoint { verified: None })
+        }
+        Err(error) => {
+            tracing::warn!(
+                key,
+                %error,
+                "discarding invalid cached checkpoint; retrying supplied source"
+            );
+            let _ = std::fs::remove_file(artifact);
+            if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
+                tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
+            }
+            None
+        }
     }
-    // Record use without changing the content fingerprint's modification time.
-    let _ = std::fs::File::options()
-        .append(true)
-        .open(src)
-        .and_then(|f| {
-            f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
-        });
-    tracing::info!(key, "restored checkpoint from the node-local cache");
-    true
 }
 
 /// Drop oldest-used entries until the directory's total is under `max`.
@@ -390,6 +469,21 @@ fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
     std::fs::create_dir_all(&root)
         .map_err(|error| ApiError::internal(format!("create checkpoint staging root: {error}")))?;
     Ok(root)
+}
+
+/// Refresh local alias provenance before TempDir removes the transfer files.
+struct CheckpointTransfer {
+    _directory: tempfile::TempDir,
+    artifact: std::path::PathBuf,
+}
+
+impl Drop for CheckpointTransfer {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        crate::artifact_cache::release_checkpoint_artifact_alias(&self.artifact);
+        #[cfg(not(target_os = "linux"))]
+        let _ = &self.artifact;
+    }
 }
 
 fn max_checkpoint_upload_bytes() -> u64 {
@@ -655,6 +749,10 @@ pub async fn capture_portable_checkpoint(
     })
     .await?;
     let result = result.map_err(checkpoint_capture_error)?;
+    let transfer = CheckpointTransfer {
+        _directory: transfer,
+        artifact: artifact.clone(),
+    };
 
     if let Some(key) = capture_options.cache_key {
         let artifact = artifact.clone();
@@ -842,7 +940,7 @@ mod checkpoint_cache_tests {
         let cached = dir.path().join("cached");
         let upload = dir.path().join("upload");
         std::fs::write(&cached, b"not a checkpoint").unwrap();
-        assert!(!take_checkpoint_cache_entry("test", &cached, &upload));
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload).is_none());
         assert!(!cached.exists());
         assert!(!upload.exists());
         std::fs::OpenOptions::new()
@@ -850,6 +948,35 @@ mod checkpoint_cache_tests {
             .create_new(true)
             .open(upload)
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changing_cache_identity_preserves_hit_but_does_not_handoff_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let upload = dir.path().join("upload");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://cache-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&cached)
+            .unwrap();
+        let hit =
+            super::take_checkpoint_cache_entry_with_verifier("test", &cached, &upload, |_| {
+                Ok(crate::portable_checkpoint::SidecarVerification::ChangedDuringRead)
+            })
+            .expect("unstable identity is still a cache hit");
+        assert!(
+            hit.verified.is_none(),
+            "creation must verify the artifact again"
+        );
+        assert!(cached.exists());
+        assert!(upload.exists());
+        assert!(crate::portable_checkpoint::verified_sidecar_footer(&upload).is_ok());
     }
 
     #[test]
@@ -874,7 +1001,7 @@ mod checkpoint_cache_tests {
             .set_modified(old)
             .unwrap();
         let before = std::fs::metadata(&cached).unwrap().modified().unwrap();
-        assert!(take_checkpoint_cache_entry("test", &cached, &upload));
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload).is_some());
         assert_eq!(
             std::fs::metadata(&cached).unwrap().modified().unwrap(),
             before
@@ -1034,19 +1161,25 @@ pub async fn restore_portable_checkpoint(
         .tempdir_in(checkpoint_transfer_root()?)
         .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
     let artifact = transfer.path().join("upload.smolcheckpoint");
+    let _transfer = CheckpointTransfer {
+        _directory: transfer,
+        artifact: artifact.clone(),
+    };
     let limit = max_checkpoint_upload_bytes();
     // A cached artifact is hard-linked straight into the staging directory:
     // nothing is created or fetched, and the cache's own inode is untouched by
     // whatever the restore does with its copy. Checked before any file exists
     // at `artifact`, since a link cannot land on an existing path.
-    let cache_hit = if let Some(key) = options.cache_key.clone() {
+    let cached = if let Some(key) = options.cache_key.clone() {
         let artifact = artifact.clone();
         tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
             .await
             .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
     } else {
-        false
+        None
     };
+    let cache_hit = cached.is_some();
+    let verified = cached.and_then(|entry| entry.verified);
     let received: u64 = if cache_hit {
         std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -1170,7 +1303,10 @@ pub async fn restore_portable_checkpoint(
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
     // dropped, installing owned checkpoint payloads and exact qcow chains.
-    let result = create_machine(State(state), Json(request)).await;
+    // The cache take verified this request's pinned artifact; hand that
+    // verification over so creation does not read the payload a second time.
+    // It only applies if the path creation uses still names that exact inode.
+    let result = create_machine_inner(State(state), Json(request), verified).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
     if result.is_ok() {
@@ -1406,6 +1542,19 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    create_machine_inner(State(state), Json(req), None).await
+}
+
+/// [`create_machine`], optionally reusing a verification of the `from`
+/// artifact that this same request already performed on a pinned descriptor.
+/// The reuse is granted only when the path about to be used still resolves to
+/// that unchanged inode; otherwise the artifact is verified afresh here. This
+/// is a private request-scoped handoff, not a public option.
+async fn create_machine_inner(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateMachineRequest>,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+) -> Result<Json<MachineInfo>, ApiError> {
     #[cfg(target_os = "linux")]
     let mut req = req;
     #[cfg(target_os = "linux")]
@@ -1605,8 +1754,15 @@ pub async fn create_machine(
                 sidecar_path
             )));
         }
-        crate::portable_checkpoint::verified_sidecar_footer(path)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if verified.as_ref().is_some_and(|input| input.covers(path)) {
+            tracing::info!(
+                artifact = %sidecar_path,
+                "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
+            );
+        } else {
+            crate::portable_checkpoint::verified_sidecar_footer(path)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
         let checkpoint = manifest.checkpoint.clone();
