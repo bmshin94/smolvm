@@ -89,7 +89,7 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 # does the TLS handshake + client-cert verification; rustls-pemfile parses the
 # CA/cert/key PEMs handed to us at enrollment.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
