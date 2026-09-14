@@ -1286,25 +1286,58 @@ fn lock_uid_registry(registry_dir: &std::path::Path) -> std::io::Result<std::fs:
 #[cfg(not(target_os = "linux"))]
 pub fn free_vm_uid(_registry_dir: &std::path::Path, _key_dir: &std::path::Path) {}
 
-/// The `(uid, gid)` a VM's VMM should drop to, allocated **collision-free** from
-/// `registry_dir`. Returns:
-/// - `None` — the drop doesn't apply (unprivileged launcher, or
-///   `SMOLVM_VM_UID_DROP=off`); boot proceeds without a drop.
-/// - `Some(Err(_))` — the drop is **active but allocation failed**; the caller
-///   MUST refuse to boot (fail closed — never silently run the VMM over-
-///   privileged, the same contract as `drop_privileges`).
-/// - `Some(Ok((uid, gid)))` — drop to this id.
-///
-/// A fork clone (`snapshot_dir` set, laid out as `<golden_dir>/s/<snapshot-id>`)
-/// resolves to the GOLDEN's uid so it can
-/// map the golden's memfd. gid mirrors uid (a per-VM group).
-///
-/// `share_uid_with` (when set) overrides the key resolution entirely: the VM
-/// resolves to THAT data dir's uid instead of claiming its own. Used by the
-/// pack-from-vm helper, which must read the source VM's 0700 disks — same trust
-/// domain, same uid (mirroring how a fork clone shares its golden's uid). The
-/// borrower never writes its own `.vm-uid`, so deleting it can't free the
-/// owner's uid.
+/// Find the registered owner of a directory's existing VM identity.
+#[cfg(target_os = "linux")]
+fn shared_uid_owner_dir(
+    registry_dir: &std::path::Path,
+    directory: &std::path::Path,
+    uid: u32,
+) -> std::io::Result<std::path::PathBuf> {
+    if !(VM_UID_BASE..VM_UID_BASE.saturating_add(VM_UID_SPAN)).contains(&uid) {
+        // A directory not yet assigned a VM uid follows normal allocation.
+        return Ok(directory.to_path_buf());
+    }
+    let key = uid_marker_key(registry_dir, uid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "shared VM directory {} has UID {uid} without a registered owner",
+                directory.display()
+            ),
+        )
+    })?;
+    let mut components = std::path::Path::new(&key).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "shared VM UID registry contains an invalid owner key",
+        ));
+    }
+    let owner = registry_dir
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UID registry has no parent",
+            )
+        })?
+        .join("vms")
+        .join(key);
+    if !owner.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("registered owner of shared VM UID {uid} no longer exists"),
+        ));
+    }
+    Ok(owner)
+}
+
+/// Allocate a VM identity, or borrow its snapshot/source directory's identity.
+/// Returns `None` when UID isolation is inactive; allocation errors must fail
+/// closed. Borrowers resolve to the registered owner, including when their
+/// source is itself a clone, and never claim or free an identity of their own.
 #[cfg(target_os = "linux")]
 pub fn vm_drop_ids(
     registry_dir: &std::path::Path,
@@ -1315,7 +1348,22 @@ pub fn vm_drop_ids(
     if !vm_uid_drop_active() {
         return None;
     }
-    let key_dir = match (share_uid_with, snapshot_dir) {
+    // A clone borrows its parent's uid and has no allocation of its own.
+    // Allocating against that clone's key would create a different identity
+    // for a helper that needs to read the clone's existing 0700 directory.
+    let shared_owner = match share_uid_with {
+        Some(directory) => {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(directory)
+                .and_then(|metadata| shared_uid_owner_dir(registry_dir, directory, metadata.uid()))
+            {
+                Ok(owner) => Some(owner),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        None => None,
+    };
+    let key_dir = match (shared_owner.as_deref(), snapshot_dir) {
         (Some(owner), _) => owner,
         (None, Some(snap)) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
         (None, None) => data_dir,
@@ -3390,6 +3438,38 @@ mod tests {
         std::fs::create_dir_all(&reg).unwrap();
         std::fs::create_dir_all(&vms).unwrap();
         (base, reg, vms)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_clone_uid_resolves_to_owner_without_claiming_a_new_uid() {
+        let (base, reg, vms) = tmp_uid_dirs("shared-clone");
+        let owner = vms.join("owner");
+        let clone = vms.join("clone");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        let uid = allocate_vm_uid(&reg, &owner, "owner").unwrap();
+        let resolved = shared_uid_owner_dir(&reg, &clone, uid).unwrap();
+        assert_eq!(resolved, owner);
+        assert_eq!(allocate_vm_uid(&reg, &resolved, "owner").unwrap(), uid);
+        assert!(!clone.join(".vm-uid").exists());
+        assert_eq!(registered_uid(&reg, "clone"), None);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_uid_requires_a_live_registered_owner() {
+        let (base, reg, vms) = tmp_uid_dirs("shared-invalid");
+        let clone = vms.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
+        std::fs::write(reg.join(VM_UID_BASE.to_string()), "missing").unwrap();
+        assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
+        std::fs::write(reg.join(VM_UID_BASE.to_string()), "../clone").unwrap();
+        assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
+        assert_eq!(shared_uid_owner_dir(&reg, &clone, 0).unwrap(), clone);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(target_os = "linux")]
