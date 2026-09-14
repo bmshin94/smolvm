@@ -404,14 +404,7 @@ impl ExportVm {
     /// Mount the source machine's storage disk at `/mnt/source-storage`.
     fn mount_source_storage(&self, client: &mut AgentClient) -> crate::Result<()> {
         let (exit_code, _, stderr) = client.vm_exec(
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "mkdir -p /mnt/source-storage && mount -o ro {SOURCE_DISK_DEVICE} \
-                     /mnt/source-storage"
-                ),
-            ],
+            vec!["sh".to_string(), "-c".to_string(), source_mount_command()],
             vec![],
             None,
             None,
@@ -476,6 +469,18 @@ impl ExportVm {
         }
     }
 }
+
+/// The shell the helper runs to mount the source machine's storage read-only.
+///
+/// Built here rather than inline so a test can assert the command is
+/// well-formed: it is the first thing every export runs, so a malformed one
+/// fails every export rather than an unusual one.
+fn source_mount_command() -> String {
+    format!("mkdir -p {SOURCE_MOUNTPOINT} && mount -o ro {SOURCE_DISK_DEVICE} {SOURCE_MOUNTPOINT}")
+}
+
+/// Where the source machine's storage disk is mounted inside the helper.
+const SOURCE_MOUNTPOINT: &str = "/mnt/source-storage";
 
 /// Guest device the source machine's storage disk is attached at.
 ///
@@ -1583,6 +1588,16 @@ mod export_scratch_tests {
             "deleted a directory with no parseable pid"
         );
         assert!(unnamed.exists(), "deleted a directory with no name file");
+    }
+
+    /// Every export starts by running this, so a malformed one breaks all of
+    /// them — including the space that a line continuation would silently eat.
+    #[test]
+    fn the_source_mount_command_is_well_formed() {
+        assert_eq!(
+            super::source_mount_command(),
+            "mkdir -p /mnt/source-storage && mount -o ro /dev/vdc /mnt/source-storage"
+        );
     }
 
     /// A raw disk is sparse, so its apparent length is the size the guest sees.
