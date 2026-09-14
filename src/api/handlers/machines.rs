@@ -514,8 +514,7 @@ mod capture_transfer_tests {
             panic!("capture panicked");
         })
         .await
-        .err()
-        .expect("panic surfaces as an error");
+        .expect_err("panic surfaces as an error");
         assert!(format!("{error:?}").contains("checkpoint transfer task failed"));
         let deadline = Instant::now() + WAIT;
         while dir.exists() && Instant::now() < deadline {
