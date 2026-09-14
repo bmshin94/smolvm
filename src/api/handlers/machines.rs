@@ -304,10 +304,14 @@ fn discard_invalid_checkpoint_cache_entry(src: &std::path::Path) -> std::io::Res
 /// Look `key` up; on a hit, hard-link the entry to `artifact` (a fresh path in a
 /// staging directory) and bump its use time. Returns whether `artifact` now
 /// exists. A stale link failure just reports a miss.
-fn checkpoint_cache_take(key: &str, artifact: &std::path::Path) -> bool {
-    let Ok(src) = checkpoint_cache_path(key) else {
-        return false;
-    };
+/// On a hit, the returned verification pins `artifact`'s inode for the rest of
+/// the request so machine creation can reuse it instead of re-reading the
+/// payload (see [`crate::portable_checkpoint::VerifiedSidecar`]).
+fn checkpoint_cache_take(
+    key: &str,
+    artifact: &std::path::Path,
+) -> Option<crate::portable_checkpoint::VerifiedSidecar> {
+    let src = checkpoint_cache_path(key).ok()?;
     take_checkpoint_cache_entry(key, &src, artifact)
 }
 
@@ -315,34 +319,40 @@ fn take_checkpoint_cache_entry(
     key: &str,
     src: &std::path::Path,
     artifact: &std::path::Path,
-) -> bool {
+) -> Option<crate::portable_checkpoint::VerifiedSidecar> {
     if !src.is_file() {
-        return false;
+        return None;
     }
     if let Err(error) = std::fs::hard_link(src, artifact) {
         tracing::warn!(key, error = %error, "cached checkpoint present but could not be linked");
-        return false;
-    }
-    if crate::portable_checkpoint::verified_sidecar_footer(artifact).is_err() {
-        tracing::warn!(
-            key,
-            "discarding invalid cached checkpoint; retrying supplied source"
-        );
-        let _ = std::fs::remove_file(artifact);
-        if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
-            tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
-        }
-        return false;
+        return None;
     }
     // Record use without changing the content fingerprint's modification time.
+    // Done before verification: the touch moves the inode's ctime, and the
+    // verification below captures the identity it will later be matched on.
     let _ = std::fs::File::options()
         .append(true)
         .open(src)
         .and_then(|f| {
             f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
         });
-    tracing::info!(key, "restored checkpoint from the node-local cache");
-    true
+    match crate::portable_checkpoint::verify_sidecar_pinned(artifact) {
+        Ok(verified) => {
+            tracing::info!(key, "restored checkpoint from the node-local cache");
+            Some(verified)
+        }
+        Err(_) => {
+            tracing::warn!(
+                key,
+                "discarding invalid cached checkpoint; retrying supplied source"
+            );
+            let _ = std::fs::remove_file(artifact);
+            if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
+                tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
+            }
+            None
+        }
+    }
 }
 
 /// Drop oldest-used entries until the directory's total is under `max`.
@@ -780,7 +790,7 @@ mod checkpoint_cache_tests {
         let cached = dir.path().join("cached");
         let upload = dir.path().join("upload");
         std::fs::write(&cached, b"not a checkpoint").unwrap();
-        assert!(!take_checkpoint_cache_entry("test", &cached, &upload));
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload).is_none());
         assert!(!cached.exists());
         assert!(!upload.exists());
         std::fs::OpenOptions::new()
@@ -812,7 +822,7 @@ mod checkpoint_cache_tests {
             .set_modified(old)
             .unwrap();
         let before = std::fs::metadata(&cached).unwrap().modified().unwrap();
-        assert!(take_checkpoint_cache_entry("test", &cached, &upload));
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload).is_some());
         assert_eq!(
             std::fs::metadata(&cached).unwrap().modified().unwrap(),
             before
@@ -977,14 +987,15 @@ pub async fn restore_portable_checkpoint(
     // nothing is created or fetched, and the cache's own inode is untouched by
     // whatever the restore does with its copy. Checked before any file exists
     // at `artifact`, since a link cannot land on an existing path.
-    let cache_hit = if let Some(key) = options.cache_key.clone() {
+    let verified = if let Some(key) = options.cache_key.clone() {
         let artifact = artifact.clone();
         tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
             .await
             .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
     } else {
-        false
+        None
     };
+    let cache_hit = verified.is_some();
     let received: u64 = if cache_hit {
         std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -1108,7 +1119,10 @@ pub async fn restore_portable_checkpoint(
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
     // dropped, installing owned checkpoint payloads and exact qcow chains.
-    let result = create_machine(State(state), Json(request)).await;
+    // The cache take verified this request's pinned artifact; hand that
+    // verification over so creation does not read the payload a second time.
+    // It only applies if the path creation uses still names that exact inode.
+    let result = create_machine_inner(State(state), Json(request), verified).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
     if result.is_ok() {
@@ -1344,6 +1358,19 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    create_machine_inner(State(state), Json(req), None).await
+}
+
+/// [`create_machine`], optionally reusing a verification of the `from`
+/// artifact that this same request already performed on a pinned descriptor.
+/// The reuse is granted only when the path about to be used still resolves to
+/// that unchanged inode; otherwise the artifact is verified afresh here. This
+/// is a private request-scoped handoff, not a public option.
+async fn create_machine_inner(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateMachineRequest>,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+) -> Result<Json<MachineInfo>, ApiError> {
     #[cfg(target_os = "linux")]
     let mut req = req;
     #[cfg(target_os = "linux")]
@@ -1543,8 +1570,15 @@ pub async fn create_machine(
                 sidecar_path
             )));
         }
-        crate::portable_checkpoint::verified_sidecar_footer(path)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if verified.as_ref().is_some_and(|input| input.covers(path)) {
+            tracing::info!(
+                artifact = %sidecar_path,
+                "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
+            );
+        } else {
+            crate::portable_checkpoint::verified_sidecar_footer(path)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
         let checkpoint = manifest.checkpoint.clone();

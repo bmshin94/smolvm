@@ -1161,9 +1161,20 @@ pub fn crc32_file(path: &Path) -> Result<u32> {
 
 /// Calculate CRC32 checksum of multiple sections of a file.
 pub fn crc32_file_range(path: &Path, offset: u64, size: u64) -> Result<u32> {
-    use std::io::{Seek, SeekFrom};
-
     let mut file = File::open(path)?;
+    crc32_reader_range(&mut file, offset, size)
+}
+
+/// CRC32 of `size` bytes from `offset` of an already-open reader, so a caller
+/// that pins an artifact by descriptor verifies exactly the bytes it holds open
+/// rather than whatever a path resolves to at that instant.
+pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
+    offset: u64,
+    size: u64,
+) -> Result<u32> {
+    use std::io::SeekFrom;
+
     file.seek(SeekFrom::Start(offset))?;
 
     let mut hasher = crc32fast::Hasher::new();

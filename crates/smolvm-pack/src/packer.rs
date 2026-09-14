@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::assets::{crc32_file_range, AssetCollector};
+use crate::assets::{crc32_file_range, crc32_reader_range, AssetCollector};
 use crate::format::{PackFooter, PackManifest, FOOTER_SIZE, SIDECAR_EXTENSION};
 use crate::Result;
 
@@ -573,6 +573,11 @@ pub struct PackedInfo {
 /// the actual file size and within safe limits.
 pub fn read_footer_from_sidecar(sidecar_path: impl AsRef<Path>) -> Result<PackFooter> {
     let mut file = File::open(sidecar_path.as_ref())?;
+    read_footer_from_file(&mut file)
+}
+
+/// Read and bounds-check the footer of an already-open sidecar.
+pub fn read_footer_from_file(file: &mut File) -> Result<PackFooter> {
     let file_size = file.metadata()?.len();
 
     if file_size < FOOTER_SIZE as u64 {
@@ -687,6 +692,12 @@ pub fn verify_sidecar_checksum(
     sidecar_path: impl AsRef<Path>,
     footer: &PackFooter,
 ) -> Result<bool> {
+    let mut file = File::open(sidecar_path.as_ref())?;
+    verify_sidecar_checksum_file(&mut file, footer)
+}
+
+/// [`verify_sidecar_checksum`] over an already-open sidecar descriptor.
+pub fn verify_sidecar_checksum_file(file: &mut File, footer: &PackFooter) -> Result<bool> {
     let checksum_size = footer
         .assets_size
         .checked_add(footer.manifest_size)
@@ -696,7 +707,7 @@ pub fn verify_sidecar_checksum(
                 "assets_size + manifest_size overflow",
             ))
         })?;
-    let actual = crc32_file_range(sidecar_path.as_ref(), 0, checksum_size)?;
+    let actual = crc32_reader_range(file, 0, checksum_size)?;
     Ok(actual == footer.checksum)
 }
 

@@ -334,9 +334,65 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
 
 /// Verify a single-file artifact before reading its manifest or extracting it.
 pub fn verified_sidecar_footer(artifact: &Path) -> Result<smolvm_pack::format::PackFooter> {
-    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+    Ok(verify_sidecar_pinned(artifact)?.footer)
+}
+
+/// The exact inode a verification read, as the kernel reports it. `ctime` is
+/// kernel-maintained and moves on every content write, relink, unlink or
+/// timestamp change, so an equal identity means the same unchanged bytes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidecarIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl SidecarIdentity {
+    fn of(file: &std::fs::File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file
+            .metadata()
+            .map_err(|error| Error::agent("inspect checkpoint artifact", error.to_string()))?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+/// A single-file artifact whose footer checksum was verified through a
+/// descriptor the holder keeps open, pinning the very inode that was read.
+///
+/// This exists so one request can verify a cached artifact once and hand the
+/// result to the machine-creation path without a second full pass over the
+/// payload. Reuse is bound to the inode, never to a path or cache key:
+/// [`VerifiedSidecar::covers`] must hold for the path about to be used, or
+/// that path is verified from scratch.
+#[derive(Debug)]
+pub struct VerifiedSidecar {
+    file: std::fs::File,
+    footer: smolvm_pack::format::PackFooter,
+    #[cfg(unix)]
+    identity: SidecarIdentity,
+}
+
+/// Open `artifact` read-only and verify its footer checksum through that
+/// descriptor. Fails if the inode changed while it was being read.
+pub fn verify_sidecar_pinned(artifact: &Path) -> Result<VerifiedSidecar> {
+    let mut file = std::fs::File::open(artifact)
         .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
-    if !smolvm_pack::packer::verify_sidecar_checksum(artifact, &footer)
+    #[cfg(unix)]
+    let before = SidecarIdentity::of(&file)?;
+    let footer = smolvm_pack::packer::read_footer_from_file(&mut file)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    if !smolvm_pack::packer::verify_sidecar_checksum_file(&mut file, &footer)
         .map_err(|error| Error::agent("verify checkpoint checksum", error.to_string()))?
     {
         return Err(Error::agent(
@@ -344,7 +400,53 @@ pub fn verified_sidecar_footer(artifact: &Path) -> Result<smolvm_pack::format::P
             format!("checksum mismatch for {}", artifact.display()),
         ));
     }
-    Ok(footer)
+    #[cfg(unix)]
+    let identity = {
+        let after = SidecarIdentity::of(&file)?;
+        if after != before {
+            return Err(Error::agent(
+                "verify checkpoint checksum",
+                format!("{} changed while it was being verified", artifact.display()),
+            ));
+        }
+        after
+    };
+    Ok(VerifiedSidecar {
+        file,
+        footer,
+        #[cfg(unix)]
+        identity,
+    })
+}
+
+impl VerifiedSidecar {
+    /// The verified footer.
+    pub fn footer(&self) -> &smolvm_pack::format::PackFooter {
+        &self.footer
+    }
+
+    /// Whether `path` currently names exactly the inode this verification read,
+    /// and that inode is unchanged since (device, inode, length, mtime and ctime
+    /// all equal, for both the pinned descriptor and a fresh open of `path`).
+    /// A replacement at `path`, an in-place write, a relink, an unlink of any
+    /// other name (eviction) or a timestamp change all make this false, and the
+    /// caller must then verify `path` afresh. Never true off Unix.
+    pub fn covers(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let pinned = SidecarIdentity::of(&self.file).ok() == Some(self.identity);
+            let current = std::fs::File::open(path)
+                .ok()
+                .and_then(|file| SidecarIdentity::of(&file).ok())
+                == Some(self.identity);
+            pinned && current
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
 }
 
 struct RestoreReservation {
@@ -2296,6 +2398,96 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packed_sidecar(dir: &Path, name: &str, tag: &str) -> PathBuf {
+        let artifact = dir.join(name);
+        let manifest = smolvm_pack::format::PackManifest::new(
+            format!("vm://{tag}"),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        Packer::new(manifest).pack_artifact(&artifact).unwrap();
+        artifact
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_verification_covers_only_the_unchanged_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "pinned");
+        let link = dir.path().join("link");
+        std::fs::hard_link(&artifact, &link).unwrap();
+        let verified = verify_sidecar_pinned(&link).unwrap();
+        assert_eq!(
+            verified.footer().checksum,
+            smolvm_pack::packer::read_footer_from_sidecar(&artifact)
+                .unwrap()
+                .checksum
+        );
+        // Every name of the verified inode is covered; a different, equally
+        // valid artifact is not, whatever path it sits at.
+        assert!(verified.covers(&link));
+        assert!(verified.covers(&artifact));
+        let other = packed_sidecar(dir.path(), "other.smolcheckpoint", "other");
+        assert!(verified_sidecar_footer(&other).is_ok());
+        assert!(!verified.covers(&other));
+        // Replacement between validation and use: the new file at `link` is a
+        // different inode, and losing the `link` name moved the verified
+        // inode's ctime, so even its surviving name is no longer covered
+        // (conservative: a fresh verification of it still passes).
+        std::fs::rename(&other, &link).unwrap();
+        assert!(!verified.covers(&link));
+        assert!(!verified.covers(&artifact));
+        assert!(verified_sidecar_footer(&artifact).is_ok());
+        // In-place mutation of the pinned inode through another name.
+        let verified = verify_sidecar_pinned(&artifact).unwrap();
+        assert!(verified.covers(&artifact));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .unwrap();
+            file.write_all(b"x").unwrap();
+        }
+        assert!(!verified.covers(&artifact));
+        assert!(verified_sidecar_footer(&artifact).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_verification_is_conservative_across_eviction() {
+        // Unlinking another name (cache eviction or a cache put that relinks)
+        // changes the inode's ctime, so a handed-over verification stops
+        // covering it and the caller falls back to a full verification.
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "evict");
+        let staged = dir.path().join("staged");
+        std::fs::hard_link(&artifact, &staged).unwrap();
+        let verified = verify_sidecar_pinned(&staged).unwrap();
+        assert!(verified.covers(&staged));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::remove_file(&artifact).unwrap();
+        assert!(!verified.covers(&staged));
+        // The staged link is still a valid artifact; fresh verification passes.
+        assert!(verified_sidecar_footer(&staged).is_ok());
+    }
+
+    #[test]
+    fn pinned_verification_rejects_a_corrupt_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "corrupt");
+        let mut bytes = std::fs::read(&artifact).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        std::fs::write(&artifact, &bytes).unwrap();
+        let error = verify_sidecar_pinned(&artifact).unwrap_err().to_string();
+        assert!(error.contains("checksum mismatch"), "{error}");
+        std::fs::write(&artifact, b"short").unwrap();
+        assert!(verify_sidecar_pinned(&artifact).is_err());
+    }
 
     #[test]
     fn readonly_restore_consumption_preserves_shared_input() {
