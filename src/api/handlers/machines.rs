@@ -441,12 +441,22 @@ fn shutdown_machine_process(
     // Try graceful shutdown via vsock first.
     // If vsock connects, this confirms the process is our VM (identity verification).
     let manager = AgentManager::for_vm(name).ok();
-    let mut vsock_confirmed = false;
+    let mut shutdown_acknowledged = false;
     if let Some(ref manager) = manager {
         if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
-            vsock_confirmed = true;
-            let _ = client.shutdown();
+            shutdown_acknowledged = client.shutdown().is_ok();
         }
+    }
+
+    if graceful && !shutdown_acknowledged {
+        if pid.is_some_and(|pid| !is_alive(pid)) {
+            return true;
+        }
+        tracing::warn!(
+            name,
+            "guest shutdown was not acknowledged; preserving the live VM and its disks"
+        );
+        return false;
     }
 
     // PID-based signal handling.
@@ -455,7 +465,7 @@ fn shutdown_machine_process(
         // We intentionally do NOT use the lenient is_our_process() here because
         // it treats any alive PID as "ours" when start_time is None — which risks
         // killing an unrelated process if the OS reused the PID.
-        let identity_ok = vsock_confirmed || is_our_process_strict(pid, pid_start_time);
+        let identity_ok = shutdown_acknowledged || is_our_process_strict(pid, pid_start_time);
 
         if identity_ok {
             // On delete the disks are removed right after, so skip the SIGTERM
@@ -2623,8 +2633,8 @@ pub async fn stop_machine(
             match e.manager.stop() {
                 Ok(()) => true,
                 Err(err) => {
-                    tracing::warn!(name = %name_clone, error = %err, "manager.stop() failed, falling back to process kill");
-                    shutdown_machine_process(&name_clone, pid, pid_start_time, true)
+                    tracing::warn!(name = %name_clone, error = %err, "graceful stop failed; preserving the live VM for retry");
+                    false
                 }
             }
         } else {
@@ -2768,17 +2778,13 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                 }
                 // Prefer the registered manager (holds the flock); fall back to a
                 // PID-verified signal — same path as the stop handler.
-                let via_manager = entry
-                    .as_ref()
-                    .map(|e| e.lock().manager.stop().is_ok())
-                    .unwrap_or(false);
-                via_manager
-                    || shutdown_machine_process(
+                entry.as_ref().map(|e| e.lock().manager.stop().is_ok()).unwrap_or_else(||
+                    shutdown_machine_process(
                         &name_for_kill,
                         record.pid,
                         record.pid_start_time,
                         true,
-                    )
+                    ))
             })
             .await
             .unwrap_or(false);

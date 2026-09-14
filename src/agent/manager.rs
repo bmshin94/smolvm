@@ -2728,6 +2728,15 @@ impl AgentManager {
             false
         };
 
+        // Process identity is not proof that guest writes reached disk. A slow
+        // flush must not turn a graceful stop into an unannounced power cut.
+        if !shutdown_acked && process::is_alive(pid) {
+            return Err(Error::agent(
+                "stop agent",
+                "guest did not confirm filesystem synchronization; left the VM alive for retry",
+            ));
+        }
+
         // Identity check: vsock acknowledgement OR strict PID start-time match OR
         // an argv match on this VM's unique boot-config path. We intentionally do
         // NOT use the lenient is_our_process() here because it treats any alive
@@ -3459,6 +3468,33 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn graceful_stop_keeps_live_process_when_guest_does_not_acknowledge() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
+        let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
+        manager.vsock_socket = temp.path().join("missing-agent.sock");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as crate::process::Pid;
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid));
+        let survived = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            result.is_err(),
+            "unacknowledged shutdown must not report success"
+        );
+        assert!(
+            survived,
+            "graceful stop must not terminate an unflushed guest"
+        );
+    }
+
     /// An explicit override must win even over a real default, and a rootfs
     /// is only accepted when `sbin/init` is present — checked without following
     /// the symlink, because in a real rootfs it points at a guest-only path.
