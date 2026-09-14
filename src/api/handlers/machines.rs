@@ -559,6 +559,7 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    let mut checkpoint_phase = std::time::Instant::now();
     // Validate: registry_ref, from, and image are mutually exclusive
     let source_count = [
         req.registry_ref.is_some(),
@@ -942,6 +943,9 @@ pub async fn create_machine(
         .map(|network| network.enabled)
         .unwrap_or(req.network || manifest_net);
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
+    }
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
@@ -958,6 +962,9 @@ pub async fn create_machine(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_prepare", &mut checkpoint_phase);
+    }
     // Extract the bundle's OCI layers into this machine's own data dir (created
     // by the manager above) rather than the shared pack cache, so every start is
     // independent of the .smolmachine file surviving and the macOS layers volume
@@ -1038,6 +1045,9 @@ pub async fn create_machine(
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_extract", &mut checkpoint_phase);
+    }
     // VM-mode pack: seed this machine's overlay + storage disks from the packed
     // templates (extracted above) so a start boots the source VM's rootfs rather
     // than the bare agent-rootfs (the /bin/sh-missing bug). `open_or_create_at`
@@ -1095,6 +1105,9 @@ pub async fn create_machine(
         }
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_seed", &mut checkpoint_phase);
+    }
     // Install a live checkpoint only after the ordinary VM-mode templates have
     // been seeded. The checkpoint's exact qcow chains must be the final disk
     // publication; seeding afterwards would silently replace the captured
@@ -1126,6 +1139,9 @@ pub async fn create_machine(
         }
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
+    }
     let resources = ResourceSpec {
         cpus: Some(cpus),
         memory_mb: Some(mem),

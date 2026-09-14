@@ -16,6 +16,35 @@ use crate::Result;
 /// from causing excessive memory allocation.
 const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
 
+struct ChecksummedWriter<W> {
+    inner: W,
+    hasher: crc32fast::Hasher,
+    bytes: u64,
+}
+
+impl<W> ChecksummedWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for ChecksummedWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let count = self.inner.write(data)?;
+        self.hasher.update(&data[..count]);
+        self.bytes += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Binary packer for creating self-contained executables.
 pub struct Packer {
     stub_path: Option<std::path::PathBuf>,
@@ -171,30 +200,23 @@ impl Packer {
         fs::create_dir_all(parent)?;
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let temp_path = temp.into_temp_path();
-        let assets_temp = tempfile::NamedTempFile::new_in(parent)?;
-        let assets_path = assets_temp.into_temp_path();
-
-        let assets_size = if let Some(collector) = &self.asset_collector {
-            collector.compress(&assets_path, false)?
+        let artifact = ChecksummedWriter::new(File::create(&temp_path)?);
+        let mut artifact = if let Some(collector) = &self.asset_collector {
+            collector.compress_to(artifact, false)?
         } else {
-            let empty_file = File::create(&assets_path)?;
-            let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
+            let encoder = zstd::stream::Encoder::new(artifact, 1)?;
             let tar_builder = tar::Builder::new(encoder);
             let encoder = tar_builder.into_inner()?;
-            encoder.finish()?;
-            fs::metadata(&assets_path)?.len()
+            encoder.finish()?
         };
-
-        let mut artifact = File::create(&temp_path)?;
-        std::io::copy(&mut File::open(&assets_path)?, &mut artifact)?;
+        let assets_size = artifact.bytes;
         let manifest_json = self.manifest.to_json()?;
         let manifest_offset = assets_size;
         let manifest_size = manifest_json.len() as u64;
         artifact.write_all(&manifest_json)?;
         artifact.flush()?;
-        drop(artifact);
-
-        let checksum = crc32_file_range(&temp_path, 0, assets_size + manifest_size)?;
+        let checksum = artifact.hasher.finalize();
+        let mut artifact = artifact.inner;
         let footer = PackFooter {
             stub_size: 0,
             assets_offset: 0,
@@ -203,7 +225,6 @@ impl Packer {
             manifest_size,
             checksum,
         };
-        let mut artifact = fs::OpenOptions::new().append(true).open(&temp_path)?;
         artifact.write_all(&footer.to_bytes())?;
         artifact.sync_all()?;
         drop(artifact);
@@ -1011,6 +1032,53 @@ mod tests {
             read_manifest_from_sidecar(&output).unwrap().image,
             "vm://saved"
         );
+    }
+
+    #[test]
+    fn checksummed_writer_tracks_only_successful_short_writes() {
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.len() == 6 {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let count = bytes.len().min(3);
+                self.0.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ChecksummedWriter::new(ShortWriter(Vec::new()));
+        assert!(writer.write_all(b"123456789").is_err());
+        assert_eq!(writer.bytes, 6);
+        assert_eq!(writer.hasher.finalize(), crc32fast::hash(b"123456"));
+        assert_eq!(writer.inner.0, b"123456");
+    }
+
+    #[test]
+    fn standalone_artifact_without_assets_roundtrips() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("empty.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://empty".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let info = Packer::new(manifest).pack_artifact(&output).unwrap();
+        let footer = read_footer_from_sidecar(&output).unwrap();
+        assert_eq!(info.total_size, fs::metadata(&output).unwrap().len());
+        assert!(verify_sidecar_checksum(&output, &footer).unwrap());
+        crate::extract::extract_sidecar(
+            &output,
+            &directory.path().join("out"),
+            &footer,
+            false,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]

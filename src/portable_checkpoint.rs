@@ -33,6 +33,16 @@ const INSTALLED_DIR: &str = "portable-checkpoint";
 const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 
+pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
+    tracing::info!(
+        machine = name,
+        phase,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "checkpoint phase completed"
+    );
+    *started = std::time::Instant::now();
+}
+
 /// Optional host paths used while building a portable checkpoint artifact.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureOptions {
@@ -67,6 +77,7 @@ pub struct CaptureResult {
 /// state, and the machine remains checkpointable so it can immediately serve
 /// as a reusable rollback/fork root.
 pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) -> Result<()> {
+    let mut phase = std::time::Instant::now();
     crate::data::validate_vm_name(name, "machine name")
         .map_err(|reason| Error::config("restore checkpoint", reason))?;
     if !artifact.is_file() && !artifact.is_dir() {
@@ -96,6 +107,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
     })?;
     validate_compatibility(checkpoint)?;
     crate::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
+    log_phase(name, "restore_verify", &mut phase);
 
     // Reserve the name before touching its data directory. SDKs and CLIs may
     // run in separate processes, so a process-local lifecycle mutex is not a
@@ -134,6 +146,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
                 ));
             }
         }
+        log_phase(name, "restore_prepare", &mut phase);
         if let Some(footer) = &footer {
             smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
                 .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
@@ -141,7 +154,9 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
             crate::checkpoint_store::materialize(artifact, &cache_dir)
                 .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
         }
+        log_phase(name, "restore_extract", &mut phase);
         install(&cache_dir, &vm_data, checkpoint)?;
+        log_phase(name, "restore_install", &mut phase);
         discard_transport_pack(&vm_data)?;
         if !reservation
             .db
@@ -430,6 +445,7 @@ pub fn capture_to_path(
     options: &CaptureOptions,
 ) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
+    let mut phase = started;
     if options.store_dir.is_some() && options.staging_dir.is_some() {
         return Err(Error::config(
             "checkpoint machine",
@@ -534,6 +550,7 @@ pub fn capture_to_path(
     collector
         .create_storage_template()
         .map_err(|error| Error::agent("create checkpoint storage template", error.to_string()))?;
+    log_phase(name, "capture_assets", &mut phase);
 
     // A serve process has its own lifecycle mutex, but another CLI process
     // does not share it. Use the same source lock as `machine fork` so SAVE and
@@ -550,6 +567,7 @@ pub fn capture_to_path(
     let runtime_capture = runtime_capture_dir(name, vm)?;
     let runtime_snapshot = runtime_capture.path().join(ASSET_DIR);
     crate::agent::fork::sync_fork_source(name)?;
+    log_phase(name, "capture_sync", &mut phase);
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
@@ -579,8 +597,10 @@ pub fn capture_to_path(
         prepared_save: prepared.then(|| runtime_snapshot.clone()),
         armed: true,
     };
+    log_phase(name, "capture_prepare_memory", &mut phase);
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
+    log_phase(name, "capture_disks_and_resume", &mut phase);
     let source_pause = pause_started.elapsed();
     drop(source_lock);
 
@@ -620,6 +640,7 @@ pub fn capture_to_path(
         }
         None
     };
+    log_phase(name, "capture_finish_memory", &mut phase);
     // Export sparse files after resume; streamed RAM is already in the store.
     for file in ["checkpoint.bin", "memory.bin", "manifest.bin"] {
         if file == "memory.bin" && stored_memory.is_some() {
@@ -630,6 +651,7 @@ pub fn capture_to_path(
             &snapshot_dir.join(file),
         )?;
     }
+    log_phase(name, "capture_stage_memory", &mut phase);
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,
@@ -703,6 +725,7 @@ pub fn capture_to_path(
         network: Some(checkpoint_network(vm)),
     });
     manifest.assets = collector.into_inventory();
+    log_phase(name, "capture_manifest", &mut phase);
 
     if let Some((directory, mut writer)) = stored {
         let mut files = writer
@@ -740,6 +763,7 @@ pub fn capture_to_path(
         .with_asset_collector(collector)
         .pack_artifact(output)
         .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    log_phase(name, "capture_pack", &mut phase);
     Ok(CaptureResult {
         reused_bytes: 0,
         size_bytes: info.total_size,
