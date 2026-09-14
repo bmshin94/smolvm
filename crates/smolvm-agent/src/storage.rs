@@ -830,7 +830,7 @@ where
         std::fs::create_dir_all(&dir)?;
         info!(layer = %stem, "unpacking staged layer");
         progress("unpacking image layers", 0);
-        extract_layer_tar(tar, &dir)?;
+        extract_layer_tar_with_progress(tar, &dir, || progress("unpacking image layers", 0))?;
     }
 
     // Carry the stacking order across; without it the guest would fall back to
@@ -871,15 +871,20 @@ fn staged_tars_signature(tars: &[PathBuf]) -> Result<String> {
 /// always does — that is the whole point of unpacking here rather than on the
 /// host.
 fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
-    let out = Command::new("tar")
+    extract_layer_tar_with_progress(tar, dir, || {})
+}
+
+fn extract_layer_tar_with_progress(tar: &Path, dir: &Path, progress: impl FnMut()) -> Result<()> {
+    let mut command = Command::new("tar");
+    command
         .arg("-x")
         .arg("-f")
         .arg(tar)
         .arg("-C")
         .arg(dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    let out = command_output_with_progress(&mut command, progress)
         .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
     if !out.status.success() {
         return Err(StorageError::new(format!(
@@ -889,6 +894,30 @@ fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Drain child output while the caller keeps its streaming RPC responsive.
+fn command_output_with_progress(
+    command: &mut Command,
+    mut progress: impl FnMut(),
+) -> std::io::Result<std::process::Output> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("layer-unpack".into())
+            .spawn_scoped(scope, move || {
+                let _ = tx.send(command.output());
+            })?;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => progress(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("layer unpack worker stopped"));
+                }
+            }
+        }
+    })
 }
 
 /// The directory whose subdirs are this pack's layers, materialising them first
@@ -2313,7 +2342,10 @@ where
         info!(image = %image, "using packed layers, skipping network pull");
         // A saved-image archive is flattened, host-staged tars are unpacked
         // here, and an already-unpacked dir is used as-is.
-        return create_packed_image_info(image, &effective_packed_dir(packed_dir)?);
+        let effective = effective_packed_dir_with_progress(packed_dir, |phase, _| {
+            progress(0, 0, phase);
+        })?;
+        return create_packed_image_info(image, &effective);
     }
 
     // Determine OCI platform - default to current architecture
@@ -2609,17 +2641,55 @@ where
     })
 }
 
+/// Inspect only completed local materializations; never extract during Query.
+fn query_packed_image(
+    image: &str,
+    packed_dir: &Path,
+    storage_root: &Path,
+) -> Result<Option<ImageInfo>> {
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    let effective = if archive.exists() {
+        let key = packed_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("archive");
+        let out = storage_root.join("image-archives").join(key);
+        if std::fs::read_to_string(out.join(ARCHIVE_EXTRACTED_MARKER)).ok()
+            != Some(archive_signature(&archive)?)
+        {
+            return Ok(None);
+        }
+        out
+    } else {
+        let tars = staged_layer_tars(packed_dir)?;
+        if tars.is_empty() {
+            packed_dir.to_path_buf()
+        } else {
+            let key = packed_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("packed");
+            let out = storage_root.join(GUEST_LAYERS_DIR).join(key);
+            if std::fs::read_to_string(out.join(GUEST_LAYERS_MARKER)).ok()
+                != Some(staged_tars_signature(&tars)?)
+            {
+                return Ok(None);
+            }
+            out
+        }
+    };
+    create_packed_image_info(image, &effective).map(Some)
+}
+
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let image = normalize_image_ref(image);
     let image = image.as_str();
 
-    // Packed layers (a `.smolmachine` or a staged local image archive/dir):
-    // synthesize image info without a registry manifest, mirroring the pull
-    // path. A local image archive is flattened into a rootfs first.
+    // Query must not unpack an image: it has a short, single-response RPC
+    // deadline. Unprepared local images go through the streaming pull path.
     if let Some(packed_dir) = get_packed_layers_dir() {
-        let effective = effective_packed_dir(packed_dir)?;
-        return Ok(Some(create_packed_image_info(image, &effective)?));
+        return query_packed_image(image, packed_dir, Path::new(STORAGE_ROOT));
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -5101,6 +5171,65 @@ fn dir_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_query_does_not_extract_staged_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packed = tmp.path().join("packed");
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir(&packed).unwrap();
+        let tar = packed.join("layer.tar");
+        // Deliberately not a valid archive: Query must not attempt extraction.
+        std::fs::write(&tar, b"not an archive").unwrap();
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+        assert!(!storage.exists());
+
+        let out = storage.join(GUEST_LAYERS_DIR).join("packed");
+        std::fs::create_dir_all(out.join("layer")).unwrap();
+        // A partial extraction is not usable until its completion marker exists.
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+        std::fs::write(
+            out.join(GUEST_LAYERS_MARKER),
+            staged_tars_signature(std::slice::from_ref(&tar)).unwrap(),
+        )
+        .unwrap();
+        let info = query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.layers, vec!["sha256:layer"]);
+        std::fs::write(&tar, b"changed staged archive").unwrap();
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn packed_query_does_not_flatten_saved_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packed = tmp.path().join("packed");
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir(&packed).unwrap();
+        std::fs::write(packed.join(ARCHIVE_FILE_NAME), b"not an archive").unwrap();
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn unpack_wait_reports_progress_and_preserves_failure_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2; printf unpack-error >&2; exit 7"]);
+        let mut updates = 0;
+        let output = command_output_with_progress(&mut command, || updates += 1).unwrap();
+        assert!(updates >= 1);
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stderr, b"unpack-error");
+    }
 
     #[test]
     fn test_archive_arch_compatibility() {
