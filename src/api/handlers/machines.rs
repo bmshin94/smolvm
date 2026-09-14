@@ -378,9 +378,10 @@ fn take_checkpoint_cache_entry(
             );
             Some(verified)
         }
-        Err(_) => {
+        Err(error) => {
             tracing::warn!(
                 key,
+                %error,
                 "discarding invalid cached checkpoint; retrying supplied source"
             );
             let _ = std::fs::remove_file(artifact);
