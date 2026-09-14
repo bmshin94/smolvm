@@ -259,6 +259,15 @@ pub fn materialize_shared_pack_lease(
 
 /// Publish capture-owned prepared state without racing explicit cache pruning.
 pub fn retain_prepared_checkpoint(sidecar: &Path, prepared: &Path) -> io::Result<()> {
+    retain_prepared_checkpoint_with_identity(sidecar, prepared, None)
+}
+
+/// Retain service-owned capture state with a digest produced by the packer.
+pub fn retain_prepared_checkpoint_with_identity(
+    sidecar: &Path,
+    prepared: &Path,
+    identity: Option<&smolvm_pack::packer::PackedArtifactIdentity>,
+) -> io::Result<()> {
     let file = fs::symlink_metadata(sidecar)?;
     let parent = fs::metadata(
         sidecar
@@ -272,7 +281,12 @@ pub fn retain_prepared_checkpoint(sidecar: &Path, prepared: &Path) -> io::Result
         ));
     }
     let _lock = lock_artifact_cache(&vm_cache_root(), false)?;
-    smolvm_pack::extract::retain_prepared_checkpoint(sidecar, prepared, &shared_pack_cache_root())
+    smolvm_pack::extract::retain_prepared_checkpoint_with_identity(
+        sidecar,
+        prepared,
+        &shared_pack_cache_root(),
+        identity,
+    )
 }
 
 /// A prepared input pinned against cache pruning for the duration of import.

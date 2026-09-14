@@ -1004,10 +1004,20 @@ pub fn capture_to_path(
 
     let collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
-    let info = Packer::new(manifest)
-        .with_asset_collector(collector)
-        .pack_artifact(output)
-        .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    let packer = Packer::new(manifest).with_asset_collector(collector);
+    let retain = cfg!(target_os = "linux")
+        && options
+            .prepared_cache_budget_bytes
+            .is_some_and(|bytes| bytes > 0)
+        && smolvm_pack::extract::shared_extract_enabled();
+    let (info, identity) = if retain {
+        packer
+            .pack_artifact_with_identity(output)
+            .map(|(info, identity)| (info, Some(identity)))
+    } else {
+        packer.pack_artifact(output).map(|info| (info, None))
+    }
+    .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
     log_phase(name, "capture_pack", &mut phase);
     #[cfg(target_os = "linux")]
     if options
@@ -1015,8 +1025,11 @@ pub fn capture_to_path(
         .is_some_and(|bytes| bytes > 0)
         && smolvm_pack::extract::shared_extract_enabled()
     {
-        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint(output, &staging_dir)
-        {
+        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
+            output,
+            &staging_dir,
+            identity.as_ref(),
+        ) {
             tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
         }
         if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(

@@ -1530,6 +1530,18 @@ pub fn retain_prepared_checkpoint(
     prepared: &Path,
     shared_root: &Path,
 ) -> std::io::Result<()> {
+    retain_prepared_checkpoint_with_identity(sidecar, prepared, shared_root, None)
+}
+
+/// Retain capture-owned state using the packer's request-local digest when
+/// available; changed inputs still take the full verification path.
+#[cfg(target_os = "linux")]
+pub fn retain_prepared_checkpoint_with_identity(
+    sidecar: &Path,
+    prepared: &Path,
+    shared_root: &Path,
+    identity: Option<&crate::packer::PackedArtifactIdentity>,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let footer = crate::packer::read_footer_from_sidecar(sidecar).map_err(std::io::Error::other)?;
     let manifest =
@@ -1585,8 +1597,17 @@ pub fn retain_prepared_checkpoint(
     if retained_artifact.exists() {
         fs::remove_file(&retained_artifact)?;
     }
+    // Consume the packer's proof before our own hard-link operation changes
+    // ctime. A stale proof falls back to full verification.
+    ensure_shared_artifact_sha256_with_identity(sidecar, &target, identity)?;
     fs::hard_link(sidecar, &retained_artifact)?;
-    ensure_shared_artifact_sha256(&retained_artifact, &target)?;
+    // Capture owns both names under the cache lock; publish the post-link
+    // fingerprint rather than paying another hash for our own metadata change.
+    write_atomic_marker(
+        &shared_artifact_source_path(&target),
+        &serde_json::to_vec(&artifact_source_identity(&retained_artifact)?)
+            .map_err(std::io::Error::other)?,
+    )?;
     fs::rename(prepared, &target)?;
     File::open(shared_root)?.sync_all()?;
     Ok(())
@@ -1752,6 +1773,14 @@ fn ensure_shared_artifact_sha256(
     sidecar_path: &Path,
     shared_dir: &Path,
 ) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256_with_identity(sidecar_path, shared_dir, None)
+}
+
+fn ensure_shared_artifact_sha256_with_identity(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    identity: Option<&crate::packer::PackedArtifactIdentity>,
+) -> std::io::Result<String> {
     let digest_path = shared_artifact_sha256_path(shared_dir);
     let lock_path = digest_path.with_extension("artifact-sha256.lock");
     let lock_file = fs::OpenOptions::new()
@@ -1795,7 +1824,10 @@ fn ensure_shared_artifact_sha256(
         return Ok(cached_digest);
     }
 
-    let digest = hash_artifact_sha256(sidecar_path)?;
+    let digest = match identity.and_then(|identity| identity.digest_for(sidecar_path)) {
+        Some(digest) => digest.to_owned(),
+        None => hash_artifact_sha256(sidecar_path)?,
+    };
     write_atomic_marker(&digest_path, format!("{digest}\n").as_bytes())?;
     write_atomic_marker(
         &source_path,

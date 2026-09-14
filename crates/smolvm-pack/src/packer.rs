@@ -4,6 +4,7 @@
 //! manifest, and footer into a self-contained `.smolmachine` package.
 //! See [`crate::format`] for the binary format specification.
 
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,78 @@ use crate::Result;
 /// Maximum allowed manifest size (16 MiB) to prevent malicious/corrupt sidecars
 /// from causing excessive memory allocation.
 const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
+
+struct DigestWriter<W> {
+    inner: W,
+    sha256: Option<Sha256>,
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        if let Some(digest) = &mut self.sha256 {
+            digest.update(&bytes[..written]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A digest produced by this process while writing an artifact, never supplied
+/// by an upload, a cache key, or an on-disk marker. The descriptor pins its inode.
+pub struct PackedArtifactIdentity {
+    file: File,
+    digest: String,
+    #[cfg(unix)]
+    identity: PackedInode,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedInode {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl PackedInode {
+    fn of(file: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+impl PackedArtifactIdentity {
+    /// Conservative, request-local reuse: both the pinned descriptor and the
+    /// current path must still name the exact bytes written by the packer.
+    pub(crate) fn digest_for(&self, path: &Path) -> Option<&str> {
+        #[cfg(unix)]
+        {
+            let current = File::open(path).ok()?;
+            (PackedInode::of(&self.file).ok()? == self.identity
+                && PackedInode::of(&current).ok()? == self.identity)
+                .then_some(self.digest.as_str())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, &self.file, &self.digest);
+            None
+        }
+    }
+}
 
 struct ChecksummedWriter<W> {
     inner: W,
@@ -195,12 +268,33 @@ impl Packer {
     /// libraries in the compressed assets. It is used for portable checkpoints,
     /// which are consumed by an installed smolvm rather than executed directly.
     pub fn pack_artifact(self, output: impl AsRef<Path>) -> Result<PackedInfo> {
-        let output = output.as_ref();
+        self.pack_artifact_inner(output.as_ref(), false)
+            .map(|(info, _)| info)
+    }
+
+    /// Compute the complete artifact digest, including its footer, as it is
+    /// written. Other pack callers pay no SHA-256 cost.
+    pub fn pack_artifact_with_identity(
+        self,
+        output: impl AsRef<Path>,
+    ) -> Result<(PackedInfo, PackedArtifactIdentity)> {
+        self.pack_artifact_inner(output.as_ref(), true)
+            .map(|(info, identity)| (info, identity.expect("digest requested")))
+    }
+
+    fn pack_artifact_inner(
+        self,
+        output: &Path,
+        compute_digest: bool,
+    ) -> Result<(PackedInfo, Option<PackedArtifactIdentity>)> {
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let temp_path = temp.into_temp_path();
-        let artifact = ChecksummedWriter::new(File::create(&temp_path)?);
+        let artifact = ChecksummedWriter::new(DigestWriter {
+            inner: File::create(&temp_path)?,
+            sha256: compute_digest.then(Sha256::new),
+        });
         let mut artifact = if let Some(collector) = &self.asset_collector {
             collector.compress_to(artifact, false)?
         } else {
@@ -226,20 +320,34 @@ impl Packer {
             checksum,
         };
         artifact.write_all(&footer.to_bytes())?;
-        artifact.sync_all()?;
-        drop(artifact);
+        artifact.inner.sync_all()?;
+        let digest = artifact.sha256.map(|hash| format!("{:x}", hash.finalize()));
+        let file = artifact.inner;
 
         temp_path
             .persist_noclobber(output)
             .map_err(|error| error.error)?;
-        Ok(PackedInfo {
-            stub_size: 0,
-            assets_size,
-            manifest_size,
-            total_size: assets_size + manifest_size + FOOTER_SIZE as u64,
-            checksum,
-            sidecar_path: Some(output.to_path_buf()),
-        })
+        let identity = if let Some(digest) = digest {
+            Some(PackedArtifactIdentity {
+                #[cfg(unix)]
+                identity: PackedInode::of(&file)?,
+                file,
+                digest,
+            })
+        } else {
+            None
+        };
+        Ok((
+            PackedInfo {
+                stub_size: 0,
+                assets_size,
+                manifest_size,
+                total_size: assets_size + manifest_size + FOOTER_SIZE as u64,
+                checksum,
+                sidecar_path: Some(output.to_path_buf()),
+            },
+            identity,
+        ))
     }
 
     /// Pack everything into a single executable file (embedded format).
@@ -1066,6 +1174,64 @@ mod tests {
         assert_eq!(writer.bytes, 6);
         assert_eq!(writer.hasher.finalize(), crc32fast::hash(b"123456"));
         assert_eq!(writer.inner.0, b"123456");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_identity_covers_footer_and_rejects_changed_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("local.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (info, identity) = Packer::new(manifest)
+            .pack_artifact_with_identity(&output)
+            .unwrap();
+        let bytes = fs::read(&output).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(identity.digest_for(&output), Some(expected.as_str()));
+        assert_eq!(info.total_size, bytes.len() as u64);
+        assert!(
+            verify_sidecar_checksum(&output, &read_footer_from_sidecar(&output).unwrap()).unwrap()
+        );
+        // A downloaded/copied file has no local provenance, even when equal.
+        let copy = temp.path().join("download.smolcheckpoint");
+        fs::write(&copy, &bytes).unwrap();
+        assert!(identity.digest_for(&copy).is_none());
+        // A replacement at the original name cannot inherit its proof.
+        fs::rename(&copy, &output).unwrap();
+        assert!(identity.digest_for(&output).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_identity_rejects_same_length_mutation_with_restored_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("local.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (_, identity) = Packer::new(manifest)
+            .pack_artifact_with_identity(&output)
+            .unwrap();
+        let modified = fs::metadata(&output).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut bytes = fs::read(&output).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&output, bytes).unwrap();
+        File::options()
+            .write(true)
+            .open(&output)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(identity.digest_for(&output).is_none());
     }
 
     #[test]
