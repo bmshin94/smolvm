@@ -313,6 +313,19 @@ fn lock_checkpoint_cache_namespace(dir: &std::path::Path) -> std::io::Result<std
     Ok(lock)
 }
 
+// Readers may verify concurrently, but cache aliases must not change ctime
+// between the verifier's two fstat calls. Keep the full identity check intact.
+fn lock_checkpoint_cache_verification(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(CHECKPOINT_CACHE_LOCK))?;
+    lock.lock_shared()?;
+    Ok(lock)
+}
+
 fn discard_invalid_checkpoint_cache_entry(src: &std::path::Path) -> std::io::Result<()> {
     let parent = src
         .parent()
@@ -385,7 +398,14 @@ fn take_checkpoint_cache_entry_with_verifier(
     let verification_started = std::time::Instant::now();
     // The cache-link operation already recorded access and refreshed any local
     // provenance before verification captures its final inode identity.
-    match verify(artifact) {
+    let outcome = (|| {
+        let parent = src
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache source has no parent"))?;
+        let _lock = lock_checkpoint_cache_verification(parent)?;
+        verify(artifact)
+    })();
+    match outcome {
         Ok(crate::portable_checkpoint::SidecarVerification::Stable(verified)) => {
             tracing::info!(
                 key,
@@ -415,7 +435,13 @@ fn take_checkpoint_cache_entry_with_verifier(
                 %error,
                 "discarding invalid cached checkpoint; retrying supplied source"
             );
-            let _ = std::fs::remove_file(artifact);
+            // This staging name can still alias a valid inode another reader
+            // is checking, even if this request's verification failed.
+            if let Some(parent) = src.parent() {
+                if let Ok(_lock) = lock_checkpoint_cache_namespace(parent) {
+                    let _ = std::fs::remove_file(artifact);
+                }
+            }
             if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
                 tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
             }
@@ -473,16 +499,42 @@ fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
 
 /// Refresh local alias provenance before TempDir removes the transfer files.
 struct CheckpointTransfer {
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
     artifact: std::path::PathBuf,
 }
 
 impl Drop for CheckpointTransfer {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        crate::artifact_cache::release_checkpoint_artifact_alias(&self.artifact);
-        #[cfg(not(target_os = "linux"))]
-        let _ = &self.artifact;
+        // TempDir's unlink changes the same inode as the prepared cache. It
+        // must participate even when provenance refresh declines the alias.
+        let directory = self._directory.take();
+        let artifact = self.artifact.clone();
+        let cleanup = move || {
+            let lock = checkpoint_cache_dir()
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))
+                .and_then(|dir| lock_checkpoint_cache_namespace(&dir));
+            let _lock = match lock {
+                Ok(lock) => lock,
+                Err(error) => {
+                    // Keep the private transfer for the reaper rather than
+                    // mutate an inode without the verification lease.
+                    if let Some(directory) = directory {
+                        tracing::warn!(path = %directory.keep().display(), %error, "checkpoint transfer cleanup deferred");
+                    }
+                    return;
+                }
+            };
+            #[cfg(target_os = "linux")]
+            crate::artifact_cache::release_checkpoint_artifact_alias(&artifact);
+            #[cfg(not(target_os = "linux"))]
+            let _ = &artifact;
+            drop(directory);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(cleanup);
+        } else {
+            cleanup();
+        }
     }
 }
 
@@ -783,7 +835,7 @@ pub async fn capture_portable_checkpoint(
     .await?;
     let result = result.map_err(checkpoint_capture_error)?;
     let transfer = CheckpointTransfer {
-        _directory: transfer,
+        _directory: Some(transfer),
         artifact: artifact.clone(),
     };
 
@@ -926,6 +978,48 @@ mod checkpoint_cache_tests {
         lock_checkpoint_cache_namespace, replace_checkpoint_cache_entry,
         take_checkpoint_cache_entry,
     };
+
+    #[test]
+    fn cache_verification_excludes_alias_changes_but_allows_other_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let upload = dir.path().join("upload");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://concurrent-cache".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&cached)
+            .unwrap();
+        let hit =
+            super::take_checkpoint_cache_entry_with_verifier("test", &cached, &upload, |path| {
+                let competing = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.path().join(super::CHECKPOINT_CACHE_LOCK))
+                    .unwrap();
+                assert!(
+                    competing.try_lock().is_err(),
+                    "alias publication must wait until verification finishes"
+                );
+                competing
+                    .try_lock_shared()
+                    .expect("independent verifiers may run concurrently");
+                crate::portable_checkpoint::classify_sidecar_verification(path)
+            })
+            .unwrap();
+        assert!(hit.verified.unwrap().covers(&upload));
+        let competing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(super::CHECKPOINT_CACHE_LOCK))
+            .unwrap();
+        competing
+            .try_lock()
+            .expect("verification releases the lease before VM creation");
+    }
 
     #[test]
     fn stale_invalid_reader_does_not_remove_repaired_entry() {
@@ -1195,7 +1289,7 @@ pub async fn restore_portable_checkpoint(
         .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
     let artifact = transfer.path().join("upload.smolcheckpoint");
     let _transfer = CheckpointTransfer {
-        _directory: transfer,
+        _directory: Some(transfer),
         artifact: artifact.clone(),
     };
     let limit = max_checkpoint_upload_bytes();
@@ -1787,15 +1881,24 @@ async fn create_machine_inner(
                 sidecar_path
             )));
         }
-        if verified.as_ref().is_some_and(|input| input.covers(path)) {
-            tracing::info!(
-                artifact = %sidecar_path,
-                "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
-            );
-        } else {
-            crate::portable_checkpoint::verified_sidecar_footer(path)
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        }
+        // Cache lookup and creation are separate phases. Another restore may
+        // have changed link metadata in between; reverify under the same lease
+        // used by lookup, publication, eviction and transfer cleanup.
+        let verification_path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let _lock = lock_checkpoint_cache_verification(&checkpoint_cache_dir()?)
+                .map_err(|e| ApiError::internal(format!("lock checkpoint verification: {e}")))?;
+            if verified.as_ref().is_some_and(|input| input.covers(&verification_path)) {
+                tracing::info!(
+                    artifact = %verification_path.display(),
+                    "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
+                );
+            } else {
+                crate::portable_checkpoint::verified_sidecar_footer(&verification_path)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            }
+            Ok::<_, ApiError>(())
+        }).await.map_err(|e| ApiError::internal(format!("checkpoint verification task: {e}")))??;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
         let checkpoint = manifest.checkpoint.clone();
