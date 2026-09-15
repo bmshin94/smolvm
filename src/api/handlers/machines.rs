@@ -1013,7 +1013,14 @@ mod checkpoint_cache_tests {
                 crate::portable_checkpoint::classify_sidecar_verification(path)
             })
             .unwrap();
-        assert!(hit.verified.unwrap().covers(&upload));
+        let verified = hit.verified.unwrap();
+        #[cfg(unix)]
+        assert!(verified.covers(&upload));
+        #[cfg(not(unix))]
+        assert!(
+            !verified.covers(&upload),
+            "non-Unix verification is never reusable"
+        );
         let competing = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
