@@ -2271,9 +2271,12 @@ fn link_or_copy_verified_sparse(
     destination: &Path,
     asset: &CheckpointAsset,
 ) -> Result<()> {
-    // Linux launch assigns each VM a different owner. Hard-linking a backing
-    // lets one launch chown the other VM's disk (and the cache) underneath it.
-    // Reflinks preserve shared extents without sharing ownership metadata.
+    // Only service-owned, explicitly immutable inodes can retain shared
+    // ownership across isolated Linux launches; all other inputs stay private.
+    #[cfg(target_os = "linux")]
+    if share_service_owned_backing(source, destination, asset)? {
+        return Ok(());
+    }
     if cfg!(target_os = "linux") {
         return copy_verified_sparse(source, destination, asset);
     }
@@ -2298,6 +2301,59 @@ fn link_or_copy_verified_sparse(
         }
         Err(error) => Err(Error::agent("link checkpoint disk", error.to_string())),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn share_service_owned_backing(
+    source: &Path,
+    destination: &Path,
+    asset: &CheckpointAsset,
+) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if !crate::process::vm_uid_drop_active() {
+        return Ok(false);
+    }
+    let input = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() || metadata.len() != asset.size || !asset.sha256.is_empty() {
+        return Err(Error::agent(
+            "share checkpoint backing",
+            "invalid verified disk asset",
+        ));
+    }
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Ok(false);
+    }
+    let parent = source
+        .parent()
+        .ok_or_else(|| Error::agent("share checkpoint backing", "missing cache directory"))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir() || parent_metadata.uid() != 0 {
+        return Ok(false);
+    }
+    // Protect the cache's original name before making this inode readable.
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    // The parent cache and each VM directory remain private. Read access here
+    // lets each isolated VMM use its own link; root ownership denies chmod/write.
+    input.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let linked = std::fs::symlink_metadata(destination)?;
+    if linked.dev() != metadata.dev() || linked.ino() != metadata.ino() {
+        let _ = std::fs::remove_file(destination);
+        return Err(Error::agent(
+            "share checkpoint backing",
+            "source changed during publication",
+        ));
+    }
+    input.sync_all()?;
+    Ok(true)
 }
 
 /// Install an extracted artifact's checkpoint into one machine's private data
@@ -3033,11 +3089,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn installed_disk_backings_have_independent_ownership() {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("backing.raw");
         let file = std::fs::File::create(&source).unwrap();
         file.set_len(1024 * 1024).unwrap();
+        // Writable or untrusted input is never eligible for immutable sharing.
+        file.set_permissions(std::fs::Permissions::from_mode(0o666))
+            .unwrap();
         let asset = describe_sparse_asset(&source, "checkpoint/disks/storage/1").unwrap();
         let first = dir.path().join("first");
         let second = dir.path().join("second");
@@ -3054,6 +3113,79 @@ mod tests {
         std::fs::write(&first, b"private change").unwrap();
         assert_eq!(std::fs::metadata(&source).unwrap().len(), asset.size);
         assert_eq!(std::fs::metadata(&second).unwrap().len(), asset.size);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root to exercise isolated VMM ownership"]
+    fn shared_backings_remain_readonly_across_uid_changes_and_cache_eviction() {
+        use std::os::unix::{
+            fs::{MetadataExt, PermissionsExt},
+            process::CommandExt,
+        };
+        assert!(crate::process::vm_uid_drop_active());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let cache = root.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let source = cache.join("disk");
+        std::fs::write(&source, b"immutable disk").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let asset = describe_sparse_asset(&source, "checkpoint/disks/storage/1").unwrap();
+        for uid in [2_000_000, 2_000_001] {
+            let vm = root.path().join(uid.to_string());
+            std::fs::create_dir(&vm).unwrap();
+            std::fs::set_permissions(&vm, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(share_service_owned_backing(&source, &vm.join("disk"), &asset).unwrap());
+            crate::process::chown_tree(&vm, uid, uid).unwrap();
+        }
+        let first = root.path().join("2000000/disk");
+        let second = root.path().join("2000001/disk");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&first).unwrap().ino()
+        );
+        assert_eq!(std::fs::metadata(&first).unwrap().uid(), 0);
+        assert_eq!(std::fs::metadata(&cache).unwrap().mode() & 0o777, 0o700);
+        let owner_read = std::process::Command::new("/bin/cat")
+            .arg(&first)
+            .uid(2_000_000)
+            .gid(2_000_000)
+            .output()
+            .unwrap();
+        assert!(owner_read.status.success());
+        assert_eq!(owner_read.stdout, b"immutable disk");
+        assert!(!std::process::Command::new("/bin/chmod")
+            .args(["600"])
+            .arg(&first)
+            .uid(2_000_000)
+            .gid(2_000_000)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(!std::process::Command::new("/bin/sh")
+            .args(["-c", "printf bad > \"$1\"", "--"])
+            .arg(&first)
+            .uid(2_000_000)
+            .gid(2_000_000)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(!std::process::Command::new("/bin/cat")
+            .arg(&second)
+            .uid(2_000_000)
+            .gid(2_000_000)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(second).unwrap();
+        crate::process::chown_tree(first.parent().unwrap(), 2_000_000, 2_000_000).unwrap();
+        assert_eq!(std::fs::metadata(&first).unwrap().uid(), 0);
+        assert_eq!(std::fs::read(first).unwrap(), b"immutable disk");
     }
 
     #[test]

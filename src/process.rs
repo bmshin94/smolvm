@@ -1415,7 +1415,8 @@ pub fn ensure_traversable(dir: &std::path::Path) {
 #[cfg(not(target_os = "linux"))]
 pub fn ensure_traversable(_dir: &std::path::Path) {}
 
-/// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed). Used by
+/// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed), preserving
+/// root-owned mode-0444 data as immutable shared input. Used by
 /// the privileged launcher to hand a VM's data dir + disks + sockets to the uid
 /// its VMM will drop to. Linux-only; the caller is root.
 #[cfg(target_os = "linux")]
@@ -1433,6 +1434,14 @@ pub(crate) fn chown_tree_except(
     if excluded == Some(path) {
         return Ok(());
     }
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    // Service-owned immutable data may be shared by several restored VMs.
+    // Transferring its ownership would let one VM chmod a sibling's backing.
+    // Do not key this on link count: cache eviction/publication can change it.
+    if meta.is_file() && meta.uid() == 0 && meta.mode() & 0o7777 == 0o444 {
+        return Ok(());
+    }
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -1440,7 +1449,6 @@ pub(crate) fn chown_tree_except(
         return Err(std::io::Error::last_os_error());
     }
     // Recurse into real directories only (not symlinked ones).
-    let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_dir() {
         for entry in std::fs::read_dir(path)? {
             chown_tree_except(&entry?.path(), uid, gid, excluded)?;
