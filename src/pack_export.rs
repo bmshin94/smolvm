@@ -1714,7 +1714,20 @@ mod export_scratch_tests {
         );
         reap_stale_export_scratch_in(root.path());
         assert!(dir.exists());
+        // flock belongs to the open file description. Other tests can fork
+        // while this runs, so dropping our fd need not release the lock.
+        // Model that extra reference explicitly and verify both states.
+        let inherited = lock.try_clone().unwrap();
         drop(lock);
+        reap_stale_export_scratch_in(root.path());
+        assert!(
+            dir.exists(),
+            "a duplicated launch lock still protects scratch"
+        );
+        assert_eq!(
+            unsafe { libc::flock(inherited.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
         reap_stale_export_scratch_in(root.path());
         assert!(!dir.exists());
     }
