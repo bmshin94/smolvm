@@ -1436,7 +1436,7 @@ pub async fn restore_portable_checkpoint(
     // The cache take verified this request's pinned artifact; hand that
     // verification over so creation does not read the payload a second time.
     // It only applies if the path creation uses still names that exact inode.
-    let result = create_machine_inner(State(state), Json(request), verified).await;
+    let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
     if result.is_ok() {
@@ -1672,7 +1672,7 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    create_machine_inner(State(state), Json(req), None).await
+    create_machine_inner(State(state), Json(req), None, false).await
 }
 
 /// [`create_machine`], optionally reusing a verification of the `from`
@@ -1684,6 +1684,7 @@ async fn create_machine_inner(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+    cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
     #[cfg(target_os = "linux")]
     let mut req = req;
@@ -1705,6 +1706,8 @@ async fn create_machine_inner(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    let cached_checkpoint = cached_checkpoint || _prepared.is_some();
     let mut checkpoint_phase = std::time::Instant::now();
     // Validate: registry_ref, from, and image are mutually exclusive
     let source_count = [
@@ -1889,8 +1892,12 @@ async fn create_machine_inner(
         // used by lookup, publication, eviction and transfer cleanup.
         let verification_path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let _lock = lock_checkpoint_cache_verification(&checkpoint_cache_dir()?)
-                .map_err(|e| ApiError::internal(format!("lock checkpoint verification: {e}")))?;
+            let _lock = if cached_checkpoint {
+                Some(lock_checkpoint_cache_verification(&checkpoint_cache_dir()?)
+                    .map_err(|e| ApiError::internal(format!("lock checkpoint verification: {e}")))?)
+            } else {
+                None
+            };
             if verified.as_ref().is_some_and(|input| input.covers(&verification_path)) {
                 tracing::info!(
                     artifact = %verification_path.display(),
