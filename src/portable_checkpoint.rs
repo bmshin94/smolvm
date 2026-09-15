@@ -2360,8 +2360,22 @@ fn share_service_owned_backing(
     Ok(true)
 }
 
-/// Install an extracted artifact's checkpoint into one machine's private data
-/// directory and mark it for one-shot restore.
+/// Make the restore private before publishing readable shared backing links.
+#[cfg(target_os = "linux")]
+fn protect_restore_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)?;
+    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    // Persist privacy before any globally readable immutable inode acquires a
+    // name here. Waiting until VMM launch leaves stopped restores exposed.
+    directory.sync_all()?;
+    Ok(())
+}
+
+/// Install verified checkpoint state before a machine is launched.
 pub fn install(
     extracted: &Path,
     vm_data_dir: &Path,
@@ -2369,6 +2383,8 @@ pub fn install(
 ) -> Result<()> {
     validate_compatibility(checkpoint)?;
     validate_disk_manifest(&checkpoint.disks)?;
+    #[cfg(target_os = "linux")]
+    protect_restore_directory(vm_data_dir)?;
     let destination = vm_data_dir.join(INSTALLED_DIR);
     if destination.exists() {
         return Err(Error::agent(
@@ -3121,6 +3137,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn restore_directory_is_private_and_does_not_follow_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("restore");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&directory, &alias).unwrap();
+        assert!(protect_restore_directory(&alias).is_err());
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        protect_restore_directory(&directory).unwrap();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "requires root to exercise isolated VMM ownership"]
     fn shared_backings_remain_readonly_across_uid_changes_and_cache_eviction() {
         use std::os::unix::{
@@ -3144,8 +3182,19 @@ mod tests {
         for uid in [2_000_000, 2_000_001] {
             let vm = root.path().join(uid.to_string());
             std::fs::create_dir(&vm).unwrap();
-            std::fs::set_permissions(&vm, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&vm, std::fs::Permissions::from_mode(0o755)).unwrap();
+            protect_restore_directory(&vm).unwrap();
             assert!(share_service_owned_backing(&source, &vm.join("disk"), &asset).unwrap());
+            // The VM is not launched yet: even its future UID must not read
+            // the checkpoint until ownership is deliberately transferred.
+            assert!(!std::process::Command::new("/bin/cat")
+                .arg(vm.join("disk"))
+                .uid(uid)
+                .gid(uid)
+                .output()
+                .unwrap()
+                .status
+                .success());
             crate::process::chown_tree(&vm, uid, uid).unwrap();
         }
         let first = root.path().join("2000000/disk");
