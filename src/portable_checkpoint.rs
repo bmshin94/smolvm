@@ -2337,6 +2337,9 @@ fn share_service_owned_backing(
     // Protect the cache's original name before making this inode readable.
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     std::fs::File::open(parent)?.sync_all()?;
+    if !crate::process::mark_checkpoint_backing(&input)? {
+        return Ok(false);
+    }
     // The parent cache and each VM directory remain private. Read access here
     // lets each isolated VMM use its own link; root ownership denies chmod/write.
     input.set_permissions(std::fs::Permissions::from_mode(0o444))?;
@@ -3128,6 +3131,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
         let cache = root.path().join("cache");
+        let unrelated = root.path().join("ordinary-readonly-file");
+        std::fs::write(&unrelated, b"ordinary file").unwrap();
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o444)).unwrap();
+        crate::process::chown_tree(&unrelated, 2_000_000, 2_000_000).unwrap();
+        assert_eq!(std::fs::metadata(&unrelated).unwrap().uid(), 2_000_000);
         std::fs::create_dir(&cache).unwrap();
         let source = cache.join("disk");
         std::fs::write(&source, b"immutable disk").unwrap();
