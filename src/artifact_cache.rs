@@ -945,13 +945,13 @@ mod tests {
             let root = &root;
             let shared = &shared;
             scope.spawn(move || {
-                let _guard = lock_checkpoint_entry_in(&root, &root.join("_shared"), &shared)
+                let _guard = lock_checkpoint_entry_in(root, &root.join("_shared"), shared)
                     .unwrap()
                     .unwrap();
                 publisher_entered.send(()).unwrap();
             });
             scope.spawn(move || {
-                let _guard = lock_artifact_cache(&root, true).unwrap();
+                let _guard = lock_artifact_cache(root, true).unwrap();
                 pruner_entered.send(()).unwrap();
             });
             assert!(published.recv_timeout(Duration::from_millis(100)).is_err());
