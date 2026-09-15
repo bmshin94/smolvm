@@ -736,6 +736,21 @@ fn safe_unpack_with_policy<R: Read>(
         // restore the exporting VMM's UID onto this shared cache object.
         let host_memory =
             checkpoint && normalize_path(&entry_path) == Path::new("checkpoint/memory.bin");
+        // Disk images are host runtime inputs too. Their archived UID belongs
+        // to the exporting VMM, not to any file inside the guest filesystem.
+        let host_disk =
+            checkpoint && normalize_path(&entry_path).starts_with(Path::new("checkpoint/disks"));
+        let host_runtime = host_memory || host_disk;
+        if host_disk
+            && entry_type != tar::EntryType::Directory
+            && entry_type != tar::EntryType::Regular
+            && entry_type != tar::EntryType::GNUSparse
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint disks must be regular files or directories",
+            ));
+        }
         if host_memory
             && entry_type != tar::EntryType::Regular
             && entry_type != tar::EntryType::GNUSparse
@@ -909,7 +924,11 @@ fn safe_unpack_with_policy<R: Read>(
         // Masked to the permission bits so a hostile header cannot carry setuid,
         // setgid or sticky through, matching the sparse path.
         if entry_type == tar::EntryType::Directory {
-            let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
+            let mode = if host_disk {
+                0o700
+            } else {
+                entry.header().mode().unwrap_or(0o755) & 0o777
+            };
             if mode != 0o755 {
                 deferred_dir_modes.push((full_path.clone(), mode));
             }
@@ -921,12 +940,12 @@ fn safe_unpack_with_policy<R: Read>(
         // Read the owner off the header before the entry is consumed: the
         // sparse path streams `entry` to exhaustion, after which the header is
         // still available but reading it here keeps both branches symmetric.
-        let uid = if host_memory {
+        let uid = if host_runtime {
             0
         } else {
             entry.header().uid().unwrap_or(0)
         };
-        let gid = if host_memory {
+        let gid = if host_runtime {
             0
         } else {
             entry.header().gid().unwrap_or(0)
@@ -996,7 +1015,7 @@ fn safe_unpack_with_policy<R: Read>(
             // owners, so doing it here is the single point that applies.
             set_owner(&full_path, uid, gid);
         }
-        if host_memory {
+        if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
         }
         report.entries += 1;
@@ -4065,10 +4084,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn checkpoint_ram_is_host_owned_but_guest_files_keep_their_owner() {
+    fn checkpoint_runtime_files_are_host_owned_but_guest_files_keep_their_owner() {
         use std::os::unix::fs::MetadataExt;
         let mut builder = tar::Builder::new(Vec::new());
-        for path in ["checkpoint/memory.bin", "pgdata"] {
+        for path in ["checkpoint/disks", "checkpoint/disks/storage"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_uid(999);
+            header.set_gid(999);
+            header.set_cksum();
+            builder.append_data(&mut header, path, &b""[..]).unwrap();
+        }
+        for path in [
+            "checkpoint/memory.bin",
+            "checkpoint/disks/storage/1",
+            "pgdata",
+        ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(4);
             header.set_mode(0o666);
@@ -4094,6 +4127,12 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         assert_eq!(ram.uid(), uid);
         assert_eq!(ram.mode() & 0o777, 0o600);
+        let disk = fs::metadata(dir.path().join("checkpoint/disks/storage/1")).unwrap();
+        assert_eq!(disk.uid(), uid);
+        assert_eq!(disk.mode() & 0o777, 0o600);
+        let directory = fs::metadata(dir.path().join("checkpoint/disks/storage")).unwrap();
+        assert_eq!(directory.uid(), uid);
+        assert_eq!(directory.mode() & 0o777, 0o700);
         assert_eq!(guest.uid(), if uid == 0 { 999 } else { uid });
     }
 
