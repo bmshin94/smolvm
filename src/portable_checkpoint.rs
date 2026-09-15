@@ -2196,11 +2196,14 @@ fn copy_verified(
         }
     }
 
-    if writable {
+    if writable || cfg!(target_os = "linux") {
         // Restored guest RAM is mapped writable and becomes backing for future
         // forks. It must never alias the immutable extraction cache. Prefer a
         // filesystem reflink so even a multi-GiB sparse image stays cheap; the
         // fallback preserves holes while copying only allocated extents.
+        // Linux also chowns device/layout metadata to each isolated VMM UID.
+        // Sharing those inodes would transfer ownership away from a sibling
+        // during concurrent startup, denying it access under a private umask.
         crate::disk_utils::clone_or_copy_file(source, destination)?;
         std::fs::File::open(destination)
             .and_then(|file| file.sync_all())
@@ -2997,6 +3000,28 @@ mod tests {
         let mut incompatible = metadata;
         incompatible.runtime_abi.push_str("-other");
         assert!(validate_compatibility(&incompatible).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_private_metadata_does_not_share_ownership_with_cache_or_siblings() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("checkpoint.bin");
+        std::fs::write(&source, b"device state").unwrap();
+        let asset = describe_asset(&source, "checkpoint/checkpoint.bin").unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        copy_verified(&source, &first, &asset, false).unwrap();
+        copy_verified(&source, &second, &asset, false).unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&first).unwrap().ino()
+        );
+        assert_ne!(
+            std::fs::metadata(&first).unwrap().ino(),
+            std::fs::metadata(&second).unwrap().ino()
+        );
     }
 
     #[test]
