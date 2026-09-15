@@ -36,6 +36,8 @@ const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
+/// Username Docker uses when the secret is an OAuth identity token.
+const DOCKER_IDENTITY_TOKEN_USERNAME: &str = "<token>";
 
 fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     if value.is_empty() {
@@ -2252,9 +2254,7 @@ fn fetch_and_extract_layer(
             crane_cmd.stderr(Stdio::null());
         }
     }
-    if let Some(ref td) = temp_dir {
-        crane_cmd.env("DOCKER_CONFIG", td.path());
-    }
+    crane_cmd.env("DOCKER_CONFIG", temp_dir.path());
     apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
 
     let mut crane = crane_cmd
@@ -4921,23 +4921,17 @@ fn base64_encode(input: &str) -> String {
     result
 }
 
-/// Set up Docker auth configuration for crane commands.
+/// Set up the Docker config crane reads for a pull.
 ///
-/// Creates a temporary directory with a Docker config.json file containing
-/// registry credentials. The returned TempDir must be kept alive for the
-/// duration of the command execution.
+/// Always creates a private config directory so crane never consults a
+/// mounted `/root/.docker`: a host config that names a credential helper
+/// (`credsStore`) makes crane exec a binary the guest does not have, and the
+/// pull fails even for public images. The host resolves credentials itself
+/// and forwards them here as `auth`; a username of `<token>` carries an OAuth
+/// identity token, which crane takes as `identitytoken`.
 ///
-/// Returns `Ok(None)` if no auth is provided.
-fn setup_docker_auth(
-    image: &str,
-    auth: Option<&RegistryAuth>,
-) -> Result<Option<tempfile::TempDir>> {
-    let Some(a) = auth else {
-        return Ok(None);
-    };
-
-    let registry = extract_registry_from_image(image);
-
+/// The returned TempDir must be kept alive for the duration of the command.
+fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfile::TempDir> {
     // The guest root filesystem (and thus the default temp dir, /tmp) is
     // read-only, so create the auth config under the writable storage disk.
     let temp_dir = tempfile::Builder::new()
@@ -4947,23 +4941,29 @@ fn setup_docker_auth(
             StorageError::new(format!("failed to create temp directory for auth: {}", e))
         })?;
 
-    let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
-    let config_json = format!(
-        r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
-        registry, auth_b64
-    );
+    let config_json = match auth {
+        Some(a) => {
+            let registry = extract_registry_from_image(image);
+            let entry = if a.username == DOCKER_IDENTITY_TOKEN_USERNAME {
+                serde_json::json!({ "identitytoken": a.password })
+            } else {
+                serde_json::json!({ "auth": base64_encode(&format!("{}:{}", a.username, a.password)) })
+            };
+            debug!(
+                registry = %registry,
+                username = %a.username,
+                "using registry credentials via docker config"
+            );
+            serde_json::json!({ "auths": { registry: entry } }).to_string()
+        }
+        None => "{}".to_string(),
+    };
 
     let config_path = temp_dir.path().join("config.json");
     std::fs::write(&config_path, &config_json)
         .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
 
-    debug!(
-        registry = %registry,
-        username = %a.username,
-        "using registry credentials via docker config"
-    );
-
-    Ok(Some(temp_dir))
+    Ok(temp_dir)
 }
 
 /// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
@@ -5030,9 +5030,7 @@ fn run_crane_once(
 
     // Set up auth if provided (temp_dir must stay alive until command completes)
     let _temp_dir = setup_docker_auth(image, auth)?;
-    if let Some(ref td) = _temp_dir {
-        cmd.env("DOCKER_CONFIG", td.path());
-    }
+    cmd.env("DOCKER_CONFIG", _temp_dir.path());
 
     apply_proxy_env(&mut cmd, proxy, no_proxy);
 

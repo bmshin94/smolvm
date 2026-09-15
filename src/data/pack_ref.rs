@@ -99,6 +99,21 @@ fn configured_credential(
 ) -> Option<ProbeCredential> {
     credential_from(&settings.machines, registry)
         .or_else(|| credential_from(&settings.images, registry))
+        .or_else(|| docker_credential(registry))
+}
+
+/// The credential `docker login` stored for `registry` on this host, when
+/// smolvm's own config has none. Identity tokens need an OAuth exchange the
+/// probe client does not implement, so they are left to the in-guest pull.
+fn docker_credential(registry: &str) -> Option<ProbeCredential> {
+    let cred = crate::docker_config::credential_for(registry)?;
+    if cred.is_identity_token() {
+        return None;
+    }
+    Some(ProbeCredential::Basic {
+        username: cred.username,
+        password: cred.secret,
+    })
 }
 
 /// Whether a registry error means "you are not authorized" rather than

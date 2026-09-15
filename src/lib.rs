@@ -80,6 +80,7 @@ pub mod db;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
+pub mod docker_config;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod image_store;

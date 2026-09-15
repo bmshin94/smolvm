@@ -1321,16 +1321,34 @@ impl AgentClient {
             let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
 
-            // Get credentials from config if not explicitly provided
-            let auth = options.auth.or_else(|| {
-                registry_config.get_credentials(&registry).inspect(|creds| {
-                    tracing::debug!(
-                        registry = %registry,
-                        username = %creds.username,
-                        "using configured registry credentials"
-                    );
+            // Get credentials from config if not explicitly provided, then from
+            // what `docker login` stored on the host (inline or in a credential
+            // helper). The guest's crane accepts a username/secret pair and an
+            // identity token alike, so both forms are forwarded.
+            let auth = options
+                .auth
+                .or_else(|| {
+                    registry_config.get_credentials(&registry).inspect(|creds| {
+                        tracing::debug!(
+                            registry = %registry,
+                            username = %creds.username,
+                            "using configured registry credentials"
+                        );
+                    })
                 })
-            });
+                .or_else(|| {
+                    crate::docker_config::credential_for(&registry).map(|cred| {
+                        tracing::debug!(
+                            registry = %registry,
+                            username = %cred.username,
+                            "using host docker credentials"
+                        );
+                        RegistryAuth {
+                            username: cred.username,
+                            password: cred.secret,
+                        }
+                    })
+                });
 
             // Apply mirror if configured
             let img = if let Some(mirror) = registry_config.get_mirror(&registry) {

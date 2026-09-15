@@ -678,7 +678,9 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub docker_socket: bool,
 
-    /// Mount ~/.docker/ config into VM for registry authentication
+    /// Mount ~/.docker/ into the VM. Registry credentials from `docker login`
+    /// (credential helpers included) are resolved on the host for every pull,
+    /// so this is only needed for other contents of the directory.
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
 
@@ -1388,8 +1390,9 @@ impl RunCmd {
             // or serving a cached bake. A private image the caller cannot pull is
             // rejected here — the same registry-authorization gate the cloud path
             // uses, so caching never bypasses pull authorization. `FromConfig`
-            // reads the local docker-config credentials (so `docker login`ed
-            // private images resolve); anonymous is the fallback for public ones.
+            // reads smolvm's registry config, then the host's Docker credentials
+            // (so `docker login`ed private images resolve, credential helpers
+            // included); anonymous is the fallback for public ones.
             //
             // The resolved digest also becomes part of the cache key, so the entry
             // tracks the image's CONTENT: when a mutable tag moves upstream the key
