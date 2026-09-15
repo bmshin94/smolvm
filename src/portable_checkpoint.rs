@@ -2336,6 +2336,7 @@ fn share_service_owned_backing(
     }
     // Protect the cache's original name before making this inode readable.
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::File::open(parent)?.sync_all()?;
     // The parent cache and each VM directory remain private. Read access here
     // lets each isolated VMM use its own link; root ownership denies chmod/write.
     input.set_permissions(std::fs::Permissions::from_mode(0o444))?;
