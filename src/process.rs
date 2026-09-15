@@ -1425,6 +1425,37 @@ pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result
 }
 
 #[cfg(target_os = "linux")]
+const CHECKPOINT_BACKING_XATTR: &[u8] = b"user.smolvm.immutable-checkpoint-backing\0";
+
+/// Tag only verified, service-owned backing files. Unsupported filesystems
+/// retain the private-copy path rather than relying on a permission convention.
+#[cfg(target_os = "linux")]
+pub(crate) fn mark_checkpoint_backing(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // The descriptor and both byte slices remain live for this syscall.
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            CHECKPOINT_BACKING_XATTR.as_ptr().cast(),
+            b"1".as_ptr().cast(),
+            1,
+            0,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::EPERM | libc::ENOSYS)
+    ) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn chown_tree_except(
     path: &std::path::Path,
     uid: u32,
@@ -1436,15 +1467,35 @@ pub(crate) fn chown_tree_except(
     }
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path)?;
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Service-owned immutable data may be shared by several restored VMs.
     // Transferring its ownership would let one VM chmod a sibling's backing.
     // Do not key this on link count: cache eviction/publication can change it.
     if meta.is_file() && meta.uid() == 0 && meta.mode() & 0o7777 == 0o444 {
-        return Ok(());
+        let mut marker = [0_u8; 1];
+        // lgetxattr does not follow a substituted symlink. Only explicitly
+        // tagged, root-owned immutable files keep shared ownership; unrelated
+        // read-only files still receive the ordinary per-machine owner.
+        let length = unsafe {
+            libc::lgetxattr(
+                c.as_ptr(),
+                CHECKPOINT_BACKING_XATTR.as_ptr().cast(),
+                marker.as_mut_ptr().cast(),
+                marker.len(),
+            )
+        };
+        if length == 1 && marker == *b"1" {
+            return Ok(());
+        }
+        if length < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                return Err(error);
+            }
+        }
     }
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
