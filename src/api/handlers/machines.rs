@@ -452,6 +452,9 @@ fn take_checkpoint_cache_entry_with_verifier(
 
 /// Drop oldest-used entries until the directory's total is under `max`.
 fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
+    let Ok(_lock) = lock_checkpoint_cache_namespace(dir) else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1054,11 +1057,11 @@ mod checkpoint_cache_tests {
         std::fs::write(&cached, b"payload").unwrap();
         std::fs::hard_link(&cached, &pinned).unwrap();
         let lock = lock_checkpoint_cache_namespace(dir.path()).unwrap();
+        drop(lock);
         checkpoint_cache_evict(dir.path(), 0);
         assert!(!cached.exists());
         assert!(dir.path().join(super::CHECKPOINT_CACHE_LOCK).exists());
         assert_eq!(std::fs::read(pinned).unwrap(), b"payload");
-        drop(lock);
     }
 
     #[test]
