@@ -52,6 +52,46 @@ pub struct ArtifactCachePruneReport {
 
 struct ArtifactCacheLock(fs::File);
 
+/// Keep pruning and another publisher out while replacing a verified cache file.
+pub(crate) struct CheckpointEntryLock {
+    _entry: ArtifactCacheLock,
+    _cache: ArtifactCacheLock,
+}
+
+pub(crate) fn lock_checkpoint_entry(shared_dir: &Path) -> io::Result<Option<CheckpointEntryLock>> {
+    let root = shared_pack_cache_root();
+    if shared_dir.parent() != Some(root.as_path()) {
+        return Ok(None);
+    }
+    let cache = lock_artifact_cache(&vm_cache_root(), false)?;
+    let shared = canonical_shared_dir(shared_dir, &root)?;
+    for directory in [&root, &shared] {
+        let metadata = fs::symlink_metadata(directory)?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Ok(None);
+        }
+    }
+    let entry = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(shared.with_extension("lock"))?;
+    if unsafe { libc::flock(entry.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A cache miss is not an invitation to create an unverified extraction.
+    if !smolvm_pack::extract::is_extracted(&shared) {
+        return Ok(None);
+    }
+    read_artifact_digest(&shared)?;
+    Ok(Some(CheckpointEntryLock {
+        _entry: ArtifactCacheLock(entry),
+        _cache: cache,
+    }))
+}
+
 impl Drop for ArtifactCacheLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
