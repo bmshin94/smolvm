@@ -628,6 +628,11 @@ fn fork_continue_snapshot(_snapshot_dir: &Path) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::agent("publish snapshot metadata", "metadata path has no parent"))?;
     let partial = path.with_extension(format!(
         "{}.partial",
         path.extension()
@@ -639,8 +644,15 @@ fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
+            .mode(0o600)
             .open(&partial)
             .map_err(|error| Error::agent("create snapshot metadata", error.to_string()))?;
+        // The service writes metadata after handing the generation to the VMM.
+        // Keep it private, but readable by that generation's owner.
+        let owner = std::fs::metadata(parent)
+            .map_err(|error| Error::agent("inspect snapshot owner", error.to_string()))?;
+        crate::process::chown_tree(&partial, owner.uid(), owner.gid())
+            .map_err(|error| Error::agent("hand snapshot metadata to VMM", error.to_string()))?;
         file.write_all(contents)
             .map_err(|error| Error::agent("write snapshot metadata", error.to_string()))?;
         file.sync_all()
@@ -649,9 +661,6 @@ fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
             .map_err(|error| Error::agent("publish snapshot metadata", error.to_string()))?;
         published = true;
         let _ = std::fs::remove_file(&partial);
-        let parent = path.parent().ok_or_else(|| {
-            Error::agent("publish snapshot metadata", "metadata path has no parent")
-        })?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| Error::agent("sync snapshot directory", error.to_string()))
@@ -874,6 +883,17 @@ fn prepare_running_disk_generation(
         return Err(error);
     }
     if let Some((uid, gid)) = vm_ids {
+        #[cfg(target_os = "linux")]
+        if let Err(error) =
+            prepare_isolated_snapshot_permissions(&gdir.join("d"), &generation_disk_dir)
+                .and_then(|()| crate::process::chown_tree(&generation_disk_dir, uid, gid))
+        {
+            rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
+            return Err(Error::agent(
+                "hand disk generation to source VMM",
+                error.to_string(),
+            ));
+        }
         for (active, _, _) in &overlays {
             if let Err(error) = crate::process::chown_tree(active, uid, gid) {
                 rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
@@ -4311,7 +4331,42 @@ mod tests {
         let error = atomic_write_snapshot_file(&path, b"second\n").unwrap_err();
         assert!(error.to_string().contains("snapshot metadata"));
         assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(&path).unwrap();
+        let parent = std::fs::metadata(temp.path()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), parent.uid());
+        assert_eq!(metadata.gid(), parent.gid());
         assert!(!temp.path().join("generation-disks.tsv.partial").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root to verify isolated VMM ownership"]
+    fn snapshot_metadata_is_readable_only_by_its_isolated_owner() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = temp.path().join("s");
+        let generation = root.join("generation");
+        std::fs::create_dir_all(&generation).unwrap();
+        prepare_isolated_snapshot_permissions(&root, &generation).unwrap();
+        crate::process::chown_tree(&generation, 2_000_000, 2_000_000).unwrap();
+        let metadata = generation.join("block-pivots.tsv");
+        atomic_write_snapshot_file(&metadata, b"storage\t/private/disk\n").unwrap();
+        let read = |uid| {
+            std::process::Command::new("/bin/cat")
+                .arg(&metadata)
+                .uid(uid)
+                .gid(uid)
+                .output()
+                .unwrap()
+        };
+        let owner = read(2_000_000);
+        assert!(owner.status.success(), "{:?}", owner.stderr);
+        assert_eq!(owner.stdout, b"storage\t/private/disk\n");
+        assert!(!read(2_000_001).status.success());
     }
 
     #[test]
