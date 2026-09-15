@@ -28,6 +28,16 @@ const MAX_FORK_LINEAGE_DEPTH: usize = 32;
 
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
+#[cfg(target_os = "linux")]
+fn prepare_isolated_snapshot_permissions(root: &Path, snapshot: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // The service owns the index directory; the VMM owns only its generation.
+    // Explicit modes avoid a restrictive service umask blocking the VMM's path
+    // traversal, without exposing other generations' names or contents.
+    std::fs::set_permissions(snapshot, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o711))
+}
+
 /// Cross-process guard for one source machine's fork or checkpoint transaction.
 ///
 /// The in-process API/SDK lifecycle locks cannot serialize a separate CLI
@@ -2167,6 +2177,9 @@ pub(crate) fn prepare_forks_reusing(
         .transpose()
         .map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;
         if let Some((uid, gid)) = vm_ids {
+            #[cfg(target_os = "linux")]
+            prepare_isolated_snapshot_permissions(&snapshot_root, &snapshot_dir)
+                .map_err(|e| Error::agent("fork: prepare snapshot permissions", e.to_string()))?;
             crate::process::chown_tree(&snapshot_dir, uid, gid)
                 .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
         }
@@ -3563,6 +3576,38 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_snapshot_permissions_allow_traversal_but_keep_contents_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("s");
+        let snapshot = root.join("generation");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let payload = snapshot.join("memory.bin");
+        std::fs::write(&payload, b"private state").unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for original_mode in [0o700, 0o755] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            prepare_isolated_snapshot_permissions(&root, &snapshot).unwrap();
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o711
+            );
+            assert_eq!(
+                std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&payload).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn live_branch_ram_auto_shares_active_sibling_pages() {
