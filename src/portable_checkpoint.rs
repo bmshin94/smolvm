@@ -2271,6 +2271,12 @@ fn link_or_copy_verified_sparse(
     destination: &Path,
     asset: &CheckpointAsset,
 ) -> Result<()> {
+    // Linux launch assigns each VM a different owner. Hard-linking a backing
+    // lets one launch chown the other VM's disk (and the cache) underneath it.
+    // Reflinks preserve shared extents without sharing ownership metadata.
+    if cfg!(target_os = "linux") {
+        return copy_verified_sparse(source, destination, asset);
+    }
     let metadata = std::fs::symlink_metadata(source)
         .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
     if !metadata.file_type().is_file() || metadata.len() != asset.size {
@@ -3022,6 +3028,32 @@ mod tests {
             std::fs::metadata(&first).unwrap().ino(),
             std::fs::metadata(&second).unwrap().ino()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_disk_backings_have_independent_ownership() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("backing.raw");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        let asset = describe_sparse_asset(&source, "checkpoint/disks/storage/1").unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        link_or_copy_verified_sparse(&source, &first, &asset).unwrap();
+        link_or_copy_verified_sparse(&source, &second, &asset).unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&first).unwrap().ino()
+        );
+        assert_ne!(
+            std::fs::metadata(&first).unwrap().ino(),
+            std::fs::metadata(&second).unwrap().ino()
+        );
+        std::fs::write(&first, b"private change").unwrap();
+        assert_eq!(std::fs::metadata(&source).unwrap().len(), asset.size);
+        assert_eq!(std::fs::metadata(&second).unwrap().len(), asset.size);
     }
 
     #[test]
