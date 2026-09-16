@@ -1790,17 +1790,35 @@ mod tests {
     fn concurrent_writers_share_objects_without_losing_checkpoints() {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("cache");
+        let bytes: Vec<u8> = (0..4)
+            .flat_map(|index| std::iter::repeat_n(index + 1, CHUNK_SIZE))
+            .chain([5; 5])
+            .collect();
         std::thread::scope(|scope| {
             for n in 0..8 {
                 let cache = &cache;
+                let bytes = &bytes;
                 let directory = root.path().join(n.to_string());
                 scope.spawn(move || {
-                    capture(cache, &directory, &vec![3; CHUNK_SIZE + 5]);
-                    materialize(&directory, &directory.join("restore")).unwrap();
+                    capture(cache, &directory, bytes);
                 });
             }
         });
-        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 2);
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let bytes = &bytes;
+                let directory = root.path().join(n.to_string());
+                scope.spawn(move || {
+                    let restored = directory.join("restore");
+                    materialize(&directory, &restored).unwrap();
+                    assert_eq!(
+                        fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+                        *bytes
+                    );
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 5);
     }
 
     #[test]
