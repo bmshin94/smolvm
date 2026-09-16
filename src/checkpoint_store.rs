@@ -199,7 +199,7 @@ impl Writer {
             let count = remaining.min(CHUNK_SIZE as u64) as usize;
             source.read_exact(&mut buffer[..count])?;
             let bytes = &buffer[..count];
-            if bytes.iter().all(|b| *b == 0) {
+            if smolvm_pack::is_zero_filled(bytes) {
                 self.stats.zero_bytes += count as u64;
                 chunks.push(None);
             } else {

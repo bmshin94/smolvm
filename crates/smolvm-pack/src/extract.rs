@@ -420,7 +420,7 @@ fn unpack_sparse<R: Read>(
             break;
         }
         let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
+        if !crate::is_zero_filled(chunk) {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(chunk)?;
         }
@@ -3307,7 +3307,7 @@ pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
             break;
         }
         let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
+        if !crate::is_zero_filled(chunk) {
             dst_file.seek(SeekFrom::Start(offset))?;
             dst_file.write_all(chunk)?;
         }
@@ -3378,7 +3378,7 @@ fn copy_data_extents(src: &mut File, dst: &mut File, size: u64) -> std::io::Resu
             // An extent may be allocated yet zero-filled; keeping the zero test
             // means such regions stay holes in `dst` exactly as before.
             let chunk = &buf[..n];
-            if chunk.iter().any(|&b| b != 0) {
+            if !crate::is_zero_filled(chunk) {
                 dst.write_all(chunk)?;
             } else {
                 dst.seek(SeekFrom::Current(n as i64))?;
