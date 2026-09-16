@@ -480,16 +480,7 @@ struct Pool {
 
 impl Pool {
     fn start(cache: &Path, objects: &Path) -> Self {
-        let threads = std::env::var("SMOLVM_CHECKPOINT_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or_else(|| {
-                thread::available_parallelism()
-                    .map(|count| count.get())
-                    .unwrap_or(4)
-            })
-            .min(32);
+        let threads = worker_threads();
         let window = threads * 2;
         let (jobs, receiver) = mpsc::sync_channel::<Submission>(window);
         let receiver = Arc::new(Mutex::new(receiver));
@@ -521,6 +512,90 @@ impl Pool {
             .expect("pool sender lives until drop")
             .send((seq, bytes, done))
             .map_err(|_| ())
+    }
+}
+
+/// Worker threads for chunk work: one per core unless `SMOLVM_CHECKPOINT_THREADS`
+/// says otherwise (`1` reproduces the serial behaviour).
+fn worker_threads() -> usize {
+    std::env::var("SMOLVM_CHECKPOINT_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(4)
+        })
+        .min(32)
+}
+
+/// Run `work` over `jobs` on up to `threads` scoped threads. The first error
+/// stops new work from starting; jobs already running finish, and the error
+/// is returned once every thread has stopped.
+fn for_each_parallel<J: Send>(
+    threads: usize,
+    jobs: impl Iterator<Item = J>,
+    work: impl Fn(J) -> io::Result<()> + Sync,
+) -> io::Result<()> {
+    let failure: Mutex<Option<io::Error>> = Mutex::new(None);
+    let failed = || failure.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let (sender, receiver) = mpsc::sync_channel::<J>(threads * 2);
+    let receiver = Mutex::new(receiver);
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok(job) = job else { break };
+                if failed() {
+                    continue;
+                }
+                if let Err(error) = work(job) {
+                    failure
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert(error);
+                }
+            });
+        }
+        for job in jobs {
+            if failed() || sender.send(job).is_err() {
+                break;
+            }
+        }
+        // Closing the channel is what lets idle workers exit before the
+        // scope joins them.
+        drop(sender);
+    });
+    match failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Write `bytes` at `offset` without moving a shared cursor, so workers can
+/// fill one file concurrently.
+fn write_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0;
+        while written < bytes.len() {
+            let count = file.seek_write(&bytes[written..], offset + written as u64)?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "checkpoint asset write returned zero bytes",
+                ));
+            }
+            written += count;
+        }
+        Ok(())
     }
 }
 
@@ -732,25 +807,23 @@ pub fn materialize(directory: &Path, output: &Path) -> io::Result<PackManifest> 
                 .parent()
                 .ok_or_else(|| invalid("missing asset parent"))?,
         )?;
-        let mut file = File::options()
+        let file = File::options()
             .write(true)
             .create_new(true)
             .open(&destination)?;
-        let mut remaining = entry.size;
-        for hash in &entry.chunks {
-            let count = remaining.min(CHUNK_SIZE as u64) as usize;
-            if let Some(hash) = hash {
-                file.write_all(&read_object(
-                    &directory.join("objects").join(hash),
-                    hash,
-                    count,
-                )?)?;
-            } else {
-                file.seek(SeekFrom::Current(count as i64))?;
-            }
-            remaining -= count as u64;
-        }
+        // Size the file first: ranges no worker writes stay holes, exactly as
+        // the sequential seek-over-holes did.
         file.set_len(entry.size)?;
+        let objects = directory.join("objects");
+        let chunks = entry.chunks.iter().enumerate().filter_map(|(index, hash)| {
+            let offset = index as u64 * CHUNK_SIZE as u64;
+            let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
+            hash.as_ref().map(|hash| (offset, hash, count))
+        });
+        for_each_parallel(worker_threads(), chunks, |(offset, hash, count)| {
+            let bytes = read_object(&objects.join(hash), hash, count)?;
+            write_at(&file, offset, &bytes)
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -888,6 +961,38 @@ mod tests {
             )
             .unwrap();
         writer.finish(directory, manifest(), vec![file]).unwrap()
+    }
+
+    /// Restore decodes chunks concurrently; a corrupted object in the middle
+    /// of a many-chunk file must still fail the whole restore.
+    #[test]
+    fn a_corrupted_chunk_among_many_fails_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let saved = root.path().join("saved");
+        let mut bytes = Vec::new();
+        for index in 0..24u8 {
+            bytes.extend(std::iter::repeat_n(index + 1, CHUNK_SIZE));
+        }
+        capture(&cache, &saved, &bytes);
+        let victim = &bytes[13 * CHUNK_SIZE..14 * CHUNK_SIZE];
+        fs::write(
+            cache.join("objects").join(digest(victim)),
+            zstd::bulk::compress(&vec![0xEE; CHUNK_SIZE], 3).unwrap(),
+        )
+        .unwrap();
+        assert!(materialize(&saved, &root.path().join("restore")).is_err());
+        fs::write(
+            cache.join("objects").join(digest(victim)),
+            zstd::bulk::compress(victim, 3).unwrap(),
+        )
+        .unwrap();
+        let restored = root.path().join("restore-again");
+        materialize(&saved, &restored).unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
     }
 
     /// Chunks are stored by a pool of workers that finish in any order; the
