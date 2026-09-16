@@ -60,6 +60,33 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Make a freshly written object durable enough to publish.
+///
+/// On macOS `File::sync_all` is `fcntl(F_FULLFSYNC)`: a flush of the whole
+/// drive's write cache, not just this file. Measured on APFS it costs ~4.9 ms
+/// per call, so a 1.5 GB incremental capture (~6,000 objects) spent ~30 s of
+/// its 64 s doing device flushes one object at a time. A plain `fsync` (~0.2 ms)
+/// gets the object's data and metadata to the drive, and [`Writer::finish`]
+/// issues the one `F_FULLFSYNC` — through the index's `sync_all` — that pushes
+/// the drive cache to stable storage for every object written before it. The
+/// index is what makes objects reachable, so nothing can reference an object
+/// that the final flush did not cover. Other platforms keep `sync_all`, where
+/// it is already a per-file operation.
+fn sync_object(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
+}
+
 fn read_object(path: &Path, hash: &str, size: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64 {
@@ -147,7 +174,7 @@ impl Writer {
                             .tempfile_in(&self.cache)?;
                         let compressed = zstd::bulk::compress(bytes, 3)?;
                         temp.write_all(&compressed)?;
-                        temp.as_file().sync_all()?;
+                        sync_object(temp.as_file())?;
                         match temp.persist_noclobber(&cached) {
                             Ok(_) => {
                                 self.stats.new_bytes += compressed.len() as u64;
