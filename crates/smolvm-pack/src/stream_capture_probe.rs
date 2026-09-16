@@ -185,18 +185,28 @@ fn streamed_memory_asset_roundtrip() {
     }
     source.sync_all().unwrap();
     drop(source);
-    let orders = if std::env::var_os("SMOLVM_ASSET_PROBE_SCAN").is_some() {
+    let orders = if std::env::var_os("SMOLVM_ASSET_PROBE_MATCHED_SCAN").is_some() {
+        vec![vec![4, 3], vec![3, 4], vec![4, 3]]
+    } else if std::env::var_os("SMOLVM_ASSET_PROBE_SCAN").is_some() {
         vec![vec![0, 3], vec![3, 0], vec![0, 3]]
     } else {
         vec![vec![0, 1, 2], vec![1, 2, 0], vec![2, 0, 1]]
     };
     for (repetition, order) in orders.into_iter().enumerate() {
         for mode in order {
-            let streaming = mode != 0;
+            let streaming = mode != 0 && mode != 4;
             let row = tempfile::tempdir_in(root.path()).unwrap();
             let before = device_sectors_written();
             let started = Instant::now();
+            let mut scan_ms = 0;
+            if mode == 4 {
+                let extents =
+                    scan_extents(&mut File::open(&source_path).unwrap(), logical).unwrap();
+                assert_eq!(extents, vec![(0, resident), (logical, 0)]);
+                scan_ms = started.elapsed().as_millis();
+            }
             let snapshot = row.path().join("memory.bin");
+            let snapshot_started = Instant::now();
             let snapshot_ms = if streaming {
                 0
             } else {
@@ -209,8 +219,9 @@ fn streamed_memory_asset_roundtrip() {
                 .unwrap();
                 assert_eq!(copied, resident);
                 output.sync_all().unwrap();
-                started.elapsed().as_millis()
+                snapshot_started.elapsed().as_millis()
             };
+            let pack_started = Instant::now();
             let output_path = row.path().join("memory.tar.zst");
             let writer = ArtifactWriter::create(&output_path, true).unwrap();
             let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_LEVEL).unwrap();
@@ -219,7 +230,6 @@ fn streamed_memory_asset_roundtrip() {
                 encoder.multithread(workers as u32).unwrap();
             }
             let mut archive = tar::Builder::new(encoder);
-            let mut scan_ms = 0;
             if mode == 3 {
                 let mut input = File::open(&source_path).unwrap();
                 let scan_started = Instant::now();
@@ -263,8 +273,11 @@ fn streamed_memory_asset_roundtrip() {
                 .unwrap()
                 .finish()
                 .unwrap();
+            let pack_ms = pack_started.elapsed().as_millis();
+            let flush_started = Instant::now();
             file.sync_all().unwrap();
             File::open(row.path()).unwrap().sync_all().unwrap();
+            let capture_flush_ms = flush_started.elapsed().as_millis();
             let capture_ms = started.elapsed().as_millis();
             let captured_sectors = device_sectors_written() - before;
             let artifact_bytes = file.metadata().unwrap().len();
@@ -278,6 +291,8 @@ fn streamed_memory_asset_roundtrip() {
             let restore_started = Instant::now();
             let decoder = zstd::stream::Decoder::new(File::open(&output_path).unwrap()).unwrap();
             safe_unpack(&mut tar::Archive::new(decoder), &destination).unwrap();
+            let extract_ms = restore_started.elapsed().as_millis();
+            let restore_flush_started = Instant::now();
             let restored_path = destination.join("checkpoint/memory.bin");
             let restored = File::open(&restored_path).unwrap();
             restored.sync_all().unwrap();
@@ -286,6 +301,7 @@ fn streamed_memory_asset_roundtrip() {
                 .sync_all()
                 .unwrap();
             File::open(&destination).unwrap().sync_all().unwrap();
+            let restore_flush_ms = restore_flush_started.elapsed().as_millis();
             let restore_ms = restore_started.elapsed().as_millis();
             let restored_allocated = restored.metadata().unwrap().blocks() * 512;
             assert_eq!(restored.metadata().unwrap().len(), logical);
@@ -303,9 +319,11 @@ fn streamed_memory_asset_roundtrip() {
             println!(
                 "{}",
                 serde_json::json!({"probe":"RAM assets only, not VM checkpoint", "repetition":repetition+1,
-                "mode":(["materialized", "dense_stream", "known_sparse_stream", "scanned_sparse_stream"][mode]),
+                "mode":(["materialized", "dense_stream", "known_sparse_stream", "scanned_sparse_stream", "scanned_materialized"][mode]),
                 "streaming":streaming, "logical_bytes":logical, "resident_bytes":resident,
                 "snapshot_ms":snapshot_ms, "scan_ms":scan_ms, "capture_ms":capture_ms, "restore_ms":restore_ms,
+                "pack_including_stream_scan_ms":pack_ms, "capture_flush_ms":capture_flush_ms,
+                "extract_ms":extract_ms, "restore_flush_ms":restore_flush_ms,
                 "artifact_bytes":artifact_bytes, "snapshot_allocated":snapshot_allocated,
                 "restored_allocated":restored_allocated, "device_capture_write_bytes":captured_sectors*512,
                 "verification":"full logical byte comparison passed"})
