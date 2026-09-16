@@ -161,7 +161,9 @@ fn scanned_sparse_map_roundtrips_fragmented_and_allocated_zero_pages() {
 #[test]
 #[ignore = "multi-GiB RAM-asset feasibility measurement; not an end-to-end VM test"]
 fn streamed_memory_asset_roundtrip() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let probe_root =
+        std::env::var("SMOLVM_ASSET_PROBE_ROOT").unwrap_or_else(|_| "/var/tmp".to_string());
+    let root = tempfile::tempdir_in(&probe_root).unwrap();
     let resident = std::env::var("SMOLVM_ASSET_PROBE_MIB")
         .map(|value| value.parse::<u64>().unwrap())
         .unwrap_or(1024)
@@ -319,6 +321,7 @@ fn streamed_memory_asset_roundtrip() {
             println!(
                 "{}",
                 serde_json::json!({"probe":"RAM assets only, not VM checkpoint", "repetition":repetition+1,
+                "probe_root":probe_root,
                 "mode":(["materialized", "dense_stream", "known_sparse_stream", "scanned_sparse_stream", "scanned_materialized"][mode]),
                 "streaming":streaming, "logical_bytes":logical, "resident_bytes":resident,
                 "snapshot_ms":snapshot_ms, "scan_ms":scan_ms, "capture_ms":capture_ms, "restore_ms":restore_ms,
