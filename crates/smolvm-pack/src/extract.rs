@@ -1977,7 +1977,9 @@ fn artifact_hash_matches_existing_sha256_across_read_boundaries() {
     use sha2::{Digest, Sha256};
     let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join("artifact");
-    let bytes = vec![7; 4 * 1024 * 1024 + 65];
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024 + 65)
+        .map(|index| (index % 251) as u8)
+        .collect();
     for size in [0, 1, 63, 64, 65, bytes.len()] {
         fs::write(&artifact, &bytes[..size]).unwrap();
         assert_eq!(

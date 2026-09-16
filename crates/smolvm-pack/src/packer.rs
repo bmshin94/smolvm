@@ -1393,7 +1393,9 @@ mod tests {
 
     #[test]
     fn digest_worker_matches_existing_sha256_across_chunks() {
-        let bytes = vec![7; 1024 * 1024 + 65];
+        let bytes: Vec<u8> = (0..1024 * 1024 + 65)
+            .map(|index| (index % 251) as u8)
+            .collect();
         for size in [0, 1, 55, 56, 63, 64, 65, bytes.len()] {
             let worker = DigestWorker::spawn().unwrap();
             let split = size.min(63);
