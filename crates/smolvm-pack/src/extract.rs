@@ -4,7 +4,7 @@
 //! (sidecar mode via `runpack`) and the standalone stub executable.
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1956,7 +1956,7 @@ pub fn link_checkpoint_artifact(
 
 fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
     let mut source = File::open(sidecar_path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     let mut buffer = vec![0_u8; 4 * 1024 * 1024];
     loop {
         let read = source.read(&mut buffer)?;
@@ -1966,10 +1966,27 @@ fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..read]);
     }
     let mut digest = String::with_capacity(64);
-    for byte in hasher.finalize() {
+    for byte in hasher.finish().as_ref() {
         write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(digest)
+}
+
+#[test]
+fn artifact_hash_matches_existing_sha256_across_read_boundaries() {
+    use sha2::{Digest, Sha256};
+    let directory = tempfile::tempdir().unwrap();
+    let artifact = directory.path().join("artifact");
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024 + 65)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    for size in [0, 1, 63, 64, 65, bytes.len()] {
+        fs::write(&artifact, &bytes[..size]).unwrap();
+        assert_eq!(
+            hash_artifact_sha256(&artifact).unwrap(),
+            format!("{:x}", Sha256::digest(&bytes[..size]))
+        );
+    }
 }
 
 fn write_atomic_marker(path: &Path, contents: &[u8]) -> std::io::Result<()> {
