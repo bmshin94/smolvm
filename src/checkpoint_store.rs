@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const VERSION: u32 = 1;
@@ -42,6 +44,15 @@ pub(crate) struct WriteStats {
     pub new_logical_bytes: u64,
     pub reused_bytes: u64,
     pub zero_bytes: u64,
+}
+
+impl WriteStats {
+    fn add(&mut self, other: &WriteStats) {
+        self.new_bytes += other.new_bytes;
+        self.new_logical_bytes += other.new_logical_bytes;
+        self.reused_bytes += other.reused_bytes;
+        self.zero_bytes += other.zero_bytes;
+    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -147,6 +158,7 @@ pub(crate) struct Writer {
     _lock: File,
     cache: std::path::PathBuf,
     objects: std::path::PathBuf,
+    pool: Pool,
     pub stats: WriteStats,
 }
 
@@ -174,10 +186,12 @@ impl Writer {
                 ));
             }
         }
+        let pool = Pool::start(&cache, &objects);
         Ok(Self {
             _lock: lock,
             cache,
             objects,
+            pool,
             stats: WriteStats::default(),
         })
     }
@@ -192,62 +206,100 @@ impl Writer {
         if !safe_relative(path) || size > MAX_BYTES {
             return Err(invalid("invalid checkpoint file path or size"));
         }
-        let mut chunks = Vec::new();
         let mut remaining = size;
-        let mut buffer = vec![0; CHUNK_SIZE];
-        while remaining != 0 {
-            let count = remaining.min(CHUNK_SIZE as u64) as usize;
-            source.read_exact(&mut buffer[..count])?;
-            let bytes = &buffer[..count];
-            if smolvm_pack::is_zero_filled(bytes) {
-                self.stats.zero_bytes += count as u64;
-                chunks.push(None);
-            } else {
-                let hash = digest(bytes);
-                let cached = self.cache.join(&hash);
-                match verify_object_matches(&cached, bytes) {
-                    Ok(_) => self.stats.reused_bytes += count as u64,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        let mut temp = tempfile::Builder::new()
-                            .prefix(OBJECT_STAGING_PREFIX)
-                            .tempfile_in(&self.cache)?;
-                        let compressed = zstd::bulk::compress(bytes, 3)?;
-                        temp.write_all(&compressed)?;
-                        sync_object(temp.as_file())?;
-                        match temp.persist_noclobber(&cached) {
-                            Ok(_) => {
-                                self.stats.new_bytes += compressed.len() as u64;
-                                self.stats.new_logical_bytes += count as u64;
-                            }
-                            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                                verify_object_matches(&cached, bytes)?;
-                                self.stats.reused_bytes += count as u64;
-                            }
-                            Err(error) => return Err(error.error),
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-                let linked = self.objects.join(&hash);
-                match fs::hard_link(&cached, &linked) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        verify_object_matches(&linked, bytes)?;
-                    }
-                    // Cross-device copies would silently remove the storage
-                    // benefit, so require the store and output on one volume.
-                    Err(error) => return Err(error),
-                }
-                chunks.push(Some(hash));
+        let chunks = self.ingest_chunks(|buffer| {
+            if remaining == 0 {
+                return Ok(None);
             }
+            let count = remaining.min(CHUNK_SIZE as u64) as usize;
+            buffer.resize(count, 0);
+            source.read_exact(buffer)?;
             remaining -= count as u64;
-        }
+            Ok(Some(Job::Data))
+        })?;
         Ok(StoredFile {
             path: path.into(),
             size,
             mode: mode & 0o777,
             chunks,
         })
+    }
+
+    /// Run one file's chunks through the worker pool. `next` fills the buffer
+    /// it is handed with the next chunk in file order, or reports a hole, on
+    /// this thread — which stays the only reader of the source — while the
+    /// workers hash, compress, persist and link chunks concurrently; results
+    /// are put back in file order here. At most `window` chunks are in flight,
+    /// so the reader cannot run ahead of the workers into unbounded memory.
+    /// The first error stops submission, but every chunk already in flight is
+    /// still collected so no worker is left writing into an abandoned capture.
+    fn ingest_chunks(
+        &mut self,
+        mut next: impl FnMut(&mut Vec<u8>) -> io::Result<Option<Job>>,
+    ) -> io::Result<Vec<Option<String>>> {
+        let window = self.pool.window;
+        let (done, results) = mpsc::channel::<Done>();
+        let mut pending: Vec<Option<Option<String>>> = Vec::new();
+        let mut free: Vec<Vec<u8>> = Vec::new();
+        let mut in_flight = 0usize;
+        let mut failure: Option<io::Error> = None;
+        loop {
+            while failure.is_none() && in_flight < window {
+                let mut buffer = free.pop().unwrap_or_default();
+                buffer.clear();
+                match next(&mut buffer) {
+                    Ok(Some(Job::Hole(count))) => {
+                        self.stats.zero_bytes += count as u64;
+                        pending.push(Some(None));
+                        free.push(buffer);
+                    }
+                    Ok(Some(Job::Data)) => {
+                        let seq = pending.len();
+                        pending.push(None);
+                        if self.pool.submit(seq, buffer, done.clone()).is_err() {
+                            failure = Some(io::Error::other("checkpoint worker pool stopped"));
+                            break;
+                        }
+                        in_flight += 1;
+                    }
+                    Ok(None) => {
+                        free.push(buffer);
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if in_flight == 0 {
+                break;
+            }
+            let Done { seq, bytes, result } = results
+                .recv()
+                .map_err(|_| io::Error::other("checkpoint worker exited"))?;
+            in_flight -= 1;
+            free.push(bytes);
+            match result {
+                Ok((hash, stats)) => {
+                    self.stats.add(&stats);
+                    pending[seq] = Some(hash);
+                }
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                    pending[seq] = Some(None);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(pending
+            .into_iter()
+            .map(|slot| slot.expect("every submitted chunk resolved"))
+            .collect())
     }
 
     /// Consume the libkrun stream before accepting its final success response.
@@ -318,10 +370,12 @@ impl Writer {
             return Err(invalid("invalid checkpoint asset"));
         }
         let mut offset = 0;
-        let mut chunks = Vec::new();
         #[cfg(unix)]
         let mut seek_sparse = true;
-        while offset < size {
+        let chunks = self.ingest_chunks(|buffer| {
+            if offset >= size {
+                return Ok(None);
+            }
             let count = (size - offset).min(CHUNK_SIZE as u64);
             #[cfg(unix)]
             let hole = if seek_sparse {
@@ -347,15 +401,17 @@ impl Writer {
             };
             #[cfg(not(unix))]
             let hole = false;
-            if hole {
-                chunks.push(None);
-                self.stats.zero_bytes += count;
+            let job = if hole {
+                Job::Hole(count as usize)
             } else {
+                buffer.resize(count as usize, 0);
                 source.seek(SeekFrom::Start(offset))?;
-                chunks.extend(self.ingest(path, count, mode, source)?.chunks);
-            }
+                source.read_exact(buffer)?;
+                Job::Data
+            };
             offset += count;
-        }
+            Ok(Some(job))
+        })?;
         Ok(StoredFile {
             path: path.into(),
             size,
@@ -388,6 +444,147 @@ impl Writer {
         File::open(directory)?.sync_all()?;
         Ok(std::mem::take(&mut self.stats))
     }
+}
+
+/// One chunk of a file, as produced by the reading thread.
+enum Job {
+    /// A filesystem hole of this many bytes: recorded, never read or stored.
+    Hole(usize),
+    /// The reader filled the buffer it was handed with this chunk's bytes.
+    Data,
+}
+
+struct Done {
+    seq: usize,
+    /// The chunk buffer, handed back so the reader can refill it instead of
+    /// allocating a fresh megabyte per chunk.
+    bytes: Vec<u8>,
+    /// `None` when the chunk was all zero bytes.
+    result: io::Result<(Option<String>, WriteStats)>,
+}
+
+type Submission = (usize, Vec<u8>, mpsc::Sender<Done>);
+
+/// Worker threads that turn chunk bytes into store objects. Hashing and
+/// compressing are most of a capture's cost and every chunk is independent of
+/// every other, so they run across the machine's cores while a single reader
+/// thread stays on the (serial) source. `SMOLVM_CHECKPOINT_THREADS` overrides
+/// the worker count; `1` reproduces the serial behaviour.
+struct Pool {
+    jobs: Option<mpsc::SyncSender<Submission>>,
+    workers: Vec<thread::JoinHandle<()>>,
+    /// Chunks in flight per file: enough to keep every worker busy while the
+    /// reader refills, small enough that buffers stay at a few dozen MiB.
+    window: usize,
+}
+
+impl Pool {
+    fn start(cache: &Path, objects: &Path) -> Self {
+        let threads = std::env::var("SMOLVM_CHECKPOINT_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(4)
+            })
+            .min(32);
+        let window = threads * 2;
+        let (jobs, receiver) = mpsc::sync_channel::<Submission>(window);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let workers = (0..threads)
+            .map(|_| {
+                let receiver = Arc::clone(&receiver);
+                let cache = cache.to_path_buf();
+                let objects = objects.to_path_buf();
+                thread::spawn(move || loop {
+                    let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok((seq, bytes, done)) = next else { break };
+                    let result = store_chunk(&cache, &objects, &bytes);
+                    // The submitter may already have abandoned this file; its
+                    // receiver being gone is not an error here.
+                    let _ = done.send(Done { seq, bytes, result });
+                })
+            })
+            .collect();
+        Self {
+            jobs: Some(jobs),
+            workers,
+            window,
+        }
+    }
+
+    fn submit(&self, seq: usize, bytes: Vec<u8>, done: mpsc::Sender<Done>) -> Result<(), ()> {
+        self.jobs
+            .as_ref()
+            .expect("pool sender lives until drop")
+            .send((seq, bytes, done))
+            .map_err(|_| ())
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.jobs.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Store one chunk: all-zero chunks are only counted; otherwise hash it, reuse
+/// the cached object when it holds these exact bytes, else compress and
+/// publish it, then hard-link it into this checkpoint. Two workers (or two
+/// concurrent captures) storing the same content race on `persist_noclobber`;
+/// the loser verifies and keeps the winner's object.
+fn store_chunk(
+    cache: &Path,
+    objects: &Path,
+    bytes: &[u8],
+) -> io::Result<(Option<String>, WriteStats)> {
+    let mut stats = WriteStats::default();
+    let count = bytes.len() as u64;
+    if smolvm_pack::is_zero_filled(bytes) {
+        stats.zero_bytes += count;
+        return Ok((None, stats));
+    }
+    let hash = digest(bytes);
+    let cached = cache.join(&hash);
+    match verify_object_matches(&cached, bytes) {
+        Ok(_) => stats.reused_bytes += count,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut temp = tempfile::Builder::new()
+                .prefix(OBJECT_STAGING_PREFIX)
+                .tempfile_in(cache)?;
+            let compressed = zstd::bulk::compress(bytes, 3)?;
+            temp.write_all(&compressed)?;
+            sync_object(temp.as_file())?;
+            match temp.persist_noclobber(&cached) {
+                Ok(_) => {
+                    stats.new_bytes += compressed.len() as u64;
+                    stats.new_logical_bytes += count;
+                }
+                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                    verify_object_matches(&cached, bytes)?;
+                    stats.reused_bytes += count;
+                }
+                Err(error) => return Err(error.error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let linked = objects.join(&hash);
+    match fs::hard_link(&cached, &linked) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_object_matches(&linked, bytes)?;
+        }
+        // Cross-device copies would silently remove the storage benefit, so
+        // require the store and output on one volume.
+        Err(error) => return Err(error),
+    }
+    Ok((Some(hash), stats))
 }
 
 fn cache_lock(cache: &Path, exclusive: bool) -> io::Result<File> {
@@ -691,6 +888,36 @@ mod tests {
             )
             .unwrap();
         writer.finish(directory, manifest(), vec![file]).unwrap()
+    }
+
+    /// Chunks are stored by a pool of workers that finish in any order; the
+    /// file must still come back byte-for-byte, holes and duplicates included.
+    #[test]
+    fn concurrently_stored_chunks_keep_file_order() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let saved = root.path().join("saved");
+        let mut bytes = Vec::new();
+        for index in 0..24u8 {
+            let fill = index.wrapping_mul(37).wrapping_add(1);
+            bytes.extend(std::iter::repeat_n(fill, CHUNK_SIZE));
+            if index % 5 == 0 {
+                bytes.extend(std::iter::repeat_n(0, CHUNK_SIZE));
+            }
+            if index % 7 == 0 {
+                bytes.extend(std::iter::repeat_n(fill, CHUNK_SIZE));
+            }
+        }
+        bytes.extend(std::iter::repeat_n(9, CHUNK_SIZE / 3));
+        let stats = capture(&cache, &saved, &bytes);
+        assert_eq!(stats.zero_bytes, 5 * CHUNK_SIZE as u64);
+        assert_eq!(stats.reused_bytes, 4 * CHUNK_SIZE as u64);
+        let restored = root.path().join("restore");
+        materialize(&saved, &restored).unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
     }
 
     /// Reuse is decided from the object's presence, not by reading it back —
