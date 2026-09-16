@@ -2973,6 +2973,44 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires root for per-VM ownership validation"]
+    fn readonly_restore_rejects_mutable_input_and_retains_opened_inode() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let machine = tempfile::tempdir().unwrap();
+        let retained = machine.path().join(READONLY_INPUT_DIR);
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::set_permissions(&retained, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"original immutable RAM").unwrap();
+        let input = retained.join("memory.bin");
+
+        std::os::unix::fs::symlink(source.path(), &input).unwrap();
+        assert!(open_readonly_memory(machine.path()).is_err());
+        std::fs::remove_file(&input).unwrap();
+        std::fs::hard_link(source.path(), &input).unwrap();
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(open_readonly_memory(machine.path()).is_err());
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::chown(&input, Some(2000000), Some(2000000)).unwrap();
+        assert!(open_readonly_memory(machine.path()).is_err());
+        std::os::unix::fs::chown(&input, Some(0), Some(0)).unwrap();
+
+        let mut opened = open_readonly_memory(machine.path()).unwrap();
+        // Cache eviction or path replacement cannot redirect an already
+        // retained descriptor to a different generation's bytes.
+        std::fs::remove_file(&input).unwrap();
+        std::fs::write(&input, b"replacement generation").unwrap();
+        source.close().unwrap();
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original immutable RAM");
+        assert_eq!(std::fs::read(&input).unwrap(), b"replacement generation");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root for per-VM ownership validation"]
     fn readonly_restore_root_isolation_and_fallback() {
         use std::os::{
             fd::AsRawFd,
