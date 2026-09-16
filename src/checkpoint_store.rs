@@ -1442,6 +1442,54 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "128 MiB reflink restore benchmark; run on an isolated QA filesystem"]
+    fn verified_base_restore_cost() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = 0x6a09e667f3bcc909u64;
+        let bytes: Vec<u8> = (0..128 * CHUNK_SIZE)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let saved = root.path().join("saved");
+        let initial = root.path().join("initial");
+        let base = root.path().join("base");
+        capture(&root.path().join("cache"), &saved, &bytes);
+        materialize(&saved, &initial).unwrap();
+        assert!(promote_base(&saved, &initial, &base).unwrap());
+        for repetition in 0..3 {
+            for use_base in if repetition % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let output = root.path().join(format!("restore-{repetition}-{use_base}"));
+                let started = std::time::Instant::now();
+                materialize_with_base(&saved, &output, use_base.then_some(base.as_path())).unwrap();
+                let restored = output.join("checkpoint/memory.bin");
+                File::open(&restored).unwrap().sync_all().unwrap();
+                let elapsed = started.elapsed();
+                assert!(fs::read(&restored).unwrap() == bytes);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "probe": "128 MiB synthetic stored RAM asset; not VM readiness or Connor",
+                        "verified_base": use_base,
+                        "repetition": repetition,
+                        "cache_state": "warm source, fresh destination, interleaved",
+                        "restore_and_file_sync_ms": elapsed.as_secs_f64() * 1000.0,
+                        "bytes_verified": bytes.len(),
+                    })
+                );
+                fs::remove_dir_all(output).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn cloned_chunk_verification_checks_data_holes_and_short_reads() {
         let file = tempfile::tempfile().unwrap();
         file.set_len((2 * CHUNK_SIZE) as u64).unwrap();
