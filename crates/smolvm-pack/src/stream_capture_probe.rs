@@ -4,7 +4,7 @@ use super::safe_unpack;
 use crate::artifact_writer::ArtifactWriter;
 use crate::assets::ZSTD_LEVEL;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::time::Instant;
 
@@ -62,6 +62,102 @@ fn device_sectors_written() -> u64 {
         .unwrap()
 }
 
+fn scan_extents(reader: &mut impl Read, logical: u64) -> io::Result<Vec<(u64, u64)>> {
+    let mut buffer = [0_u8; 65536];
+    let mut extents: Vec<(u64, u64)> = Vec::new();
+    let mut offset = 0;
+    while offset < logical {
+        let count = (logical - offset).min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..count])?;
+        if buffer[..count].iter().any(|byte| *byte != 0) {
+            match extents.last_mut() {
+                Some((start, len)) if *start + *len == offset => *len += count as u64,
+                _ => {
+                    if extents.len() == 65536 {
+                        return Err(io::Error::other("prototype sparse map limit exceeded"));
+                    }
+                    extents.push((offset, count as u64));
+                }
+            }
+        }
+        offset += count as u64;
+    }
+    extents.push((logical, 0));
+    Ok(extents)
+}
+
+fn append_sparse<W: Write>(
+    archive: &mut tar::Builder<W>,
+    source: &mut (impl Read + Seek),
+    logical: u64,
+    extents: &[(u64, u64)],
+) -> io::Result<()> {
+    let stored: u64 = extents.iter().map(|(_, len)| *len).sum();
+    let mut header = tar::Header::new_gnu();
+    header.set_path("checkpoint/memory.bin")?;
+    header.set_mode(0o600);
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    header.set_size(stored);
+    let gnu = header.as_gnu_mut().unwrap();
+    gnu.set_real_size(logical);
+    for ((offset, len), slot) in extents.iter().zip(gnu.sparse.iter_mut()) {
+        slot.set_offset(*offset);
+        slot.set_length(*len);
+    }
+    gnu.set_is_extended(extents.len() > 4);
+    header.set_cksum();
+    archive.get_mut().write_all(header.as_bytes())?;
+    let rest = &extents[extents.len().min(4)..];
+    for (index, chunk) in rest.chunks(21).enumerate() {
+        let mut extra = tar::GnuExtSparseHeader::new();
+        for ((offset, len), slot) in chunk.iter().zip(extra.sparse_mut().iter_mut()) {
+            slot.set_offset(*offset);
+            slot.set_length(*len);
+        }
+        extra.set_is_extended((index + 1) * 21 < rest.len());
+        archive.get_mut().write_all(extra.as_bytes())?;
+    }
+    for (offset, len) in extents {
+        source.seek(SeekFrom::Start(*offset))?;
+        io::copy(
+            &mut ExactStream {
+                source: &mut *source,
+                remaining: *len,
+            },
+            archive.get_mut(),
+        )?;
+    }
+    let padding = (512 - stored % 512) % 512;
+    archive.get_mut().write_all(&[0; 512][..padding as usize])?;
+    Ok(())
+}
+
+#[test]
+fn scanned_sparse_map_roundtrips_fragmented_and_allocated_zero_pages() {
+    for chunks in [1, 3, 61] {
+        let mut bytes = vec![0; chunks * 65536 + 13];
+        for index in (0..chunks).step_by(2) {
+            bytes[index * 65536] = 42;
+        }
+        let logical = bytes.len() as u64;
+        let mut source = io::Cursor::new(&bytes);
+        let extents = scan_extents(&mut source, logical).unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        append_sparse(&mut archive, &mut source, logical, &extents).unwrap();
+        let packed = archive.into_inner().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        safe_unpack(&mut tar::Archive::new(&packed[..]), destination.path()).unwrap();
+        assert_eq!(
+            fs::read(destination.path().join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
+    }
+    assert_eq!(
+        scan_extents(&mut &b"short"[..], 65536).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+}
+
 #[test]
 #[ignore = "multi-GiB RAM-asset feasibility measurement; not an end-to-end VM test"]
 fn streamed_memory_asset_roundtrip() {
@@ -89,7 +185,12 @@ fn streamed_memory_asset_roundtrip() {
     }
     source.sync_all().unwrap();
     drop(source);
-    for (repetition, order) in [[0, 1, 2], [1, 2, 0], [2, 0, 1]].into_iter().enumerate() {
+    let orders = if std::env::var_os("SMOLVM_ASSET_PROBE_SCAN").is_some() {
+        vec![vec![0, 3], vec![3, 0], vec![0, 3]]
+    } else {
+        vec![vec![0, 1, 2], vec![1, 2, 0], vec![2, 0, 1]]
+    };
+    for (repetition, order) in orders.into_iter().enumerate() {
         for mode in order {
             let streaming = mode != 0;
             let row = tempfile::tempdir_in(root.path()).unwrap();
@@ -118,7 +219,14 @@ fn streamed_memory_asset_roundtrip() {
                 encoder.multithread(workers as u32).unwrap();
             }
             let mut archive = tar::Builder::new(encoder);
-            if streaming {
+            let mut scan_ms = 0;
+            if mode == 3 {
+                let mut input = File::open(&source_path).unwrap();
+                let scan_started = Instant::now();
+                let extents = scan_extents(&mut input, logical).unwrap();
+                scan_ms = scan_started.elapsed().as_millis();
+                append_sparse(&mut archive, &mut input, logical, &extents).unwrap();
+            } else if streaming {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(logical);
                 header.set_mode(0o600);
@@ -195,9 +303,9 @@ fn streamed_memory_asset_roundtrip() {
             println!(
                 "{}",
                 serde_json::json!({"probe":"RAM assets only, not VM checkpoint", "repetition":repetition+1,
-                "mode":(["materialized", "dense_stream", "known_sparse_stream"][mode]),
+                "mode":(["materialized", "dense_stream", "known_sparse_stream", "scanned_sparse_stream"][mode]),
                 "streaming":streaming, "logical_bytes":logical, "resident_bytes":resident,
-                "snapshot_ms":snapshot_ms, "capture_ms":capture_ms, "restore_ms":restore_ms,
+                "snapshot_ms":snapshot_ms, "scan_ms":scan_ms, "capture_ms":capture_ms, "restore_ms":restore_ms,
                 "artifact_bytes":artifact_bytes, "snapshot_allocated":snapshot_allocated,
                 "restored_allocated":restored_allocated, "device_capture_write_bytes":captured_sectors*512,
                 "verification":"full logical byte comparison passed"})
