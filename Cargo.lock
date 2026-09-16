@@ -3270,6 +3270,7 @@ dependencies = [
  "crc32fast",
  "dirs",
  "libc",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

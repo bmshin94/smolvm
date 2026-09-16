@@ -4,7 +4,10 @@
 //! manifest, and footer into a self-contained `.smolmachine` package.
 //! See [`crate::format`] for the binary format specification.
 
+use ring::digest::{Context, SHA256};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -67,7 +70,7 @@ struct DigestWriter<W> {
 
 struct DigestWorker {
     sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
-    worker: Option<std::thread::JoinHandle<Sha256>>,
+    worker: Option<std::thread::JoinHandle<Context>>,
 }
 
 impl DigestWorker {
@@ -76,7 +79,7 @@ impl DigestWorker {
         let worker = std::thread::Builder::new()
             .name("checkpoint-sha256".into())
             .spawn(move || {
-                let mut digest = Sha256::new();
+                let mut digest = Context::new(&SHA256);
                 for bytes in receiver {
                     digest.update(&bytes);
                 }
@@ -114,7 +117,11 @@ impl DigestWorker {
             .expect("live digest worker")
             .join()
             .map_err(|_| std::io::Error::other("checkpoint digest worker failed"))?;
-        Ok(format!("{:x}", digest.finalize()))
+        let mut encoded = String::with_capacity(64);
+        for byte in digest.finish().as_ref() {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Ok(encoded)
     }
 }
 
@@ -1385,10 +1392,26 @@ mod tests {
     }
 
     #[test]
+    fn digest_worker_matches_existing_sha256_across_chunks() {
+        let bytes = vec![7; 1024 * 1024 + 65];
+        for size in [0, 1, 55, 56, 63, 64, 65, bytes.len()] {
+            let worker = DigestWorker::spawn().unwrap();
+            let split = size.min(63);
+            worker.update(&bytes[..split]).unwrap();
+            worker.update(&[]).unwrap();
+            worker.update(&bytes[split..size]).unwrap();
+            assert_eq!(
+                worker.finish().unwrap(),
+                format!("{:x}", Sha256::digest(&bytes[..size]))
+            );
+        }
+    }
+
+    #[test]
     fn failed_digest_worker_cannot_publish_a_digest() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(2);
         drop(receiver);
-        let worker = std::thread::spawn(|| -> Sha256 { panic!("test digest worker failure") });
+        let worker = std::thread::spawn(|| -> Context { panic!("test digest worker failure") });
         let digest = DigestWorker {
             sender: Some(sender),
             worker: Some(worker),
