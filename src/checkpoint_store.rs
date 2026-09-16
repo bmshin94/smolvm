@@ -1331,6 +1331,9 @@ mod tests {
         fs::create_dir(&base).unwrap();
         File::create(base.join(BASE_LOCK)).unwrap();
         let next = lock_base(&base, false).unwrap();
+        // Test contention with the first reader, not platform-specific
+        // semantics for upgrading our own shared lock to an exclusive one.
+        next.unlock().unwrap();
         assert!(
             next.try_lock().is_err(),
             "a replaced base bypassed an active reader's lock"
