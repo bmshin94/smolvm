@@ -492,7 +492,21 @@ impl Pool {
         objects: &Path,
         budget: Arc<WorkerBudget>,
     ) -> io::Result<Self> {
-        let permit = budget.acquire(worker_threads());
+        Self::start_with_spawner(cache, objects, budget, worker_threads(), |job| {
+            thread::Builder::new()
+                .name("checkpoint-store".into())
+                .spawn(job)
+        })
+    }
+
+    fn start_with_spawner(
+        cache: &Path,
+        objects: &Path,
+        budget: Arc<WorkerBudget>,
+        requested: usize,
+        mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<thread::JoinHandle<()>>,
+    ) -> io::Result<Self> {
+        let permit = budget.acquire(requested);
         let threads = permit.count;
         let window = (threads * 2).max(1);
         let (jobs, receiver) = mpsc::sync_channel::<Submission>(window);
@@ -502,16 +516,14 @@ impl Pool {
             let receiver = Arc::clone(&receiver);
             let cache = cache.to_path_buf();
             let objects = objects.to_path_buf();
-            let worker = thread::Builder::new()
-                .name("checkpoint-store".into())
-                .spawn(move || loop {
-                    let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                    let Ok((seq, bytes, done)) = next else { break };
-                    let result = worker_result(|| store_chunk(&cache, &objects, &bytes));
-                    // The submitter may already have abandoned this file; its
-                    // receiver being gone is not an error here.
-                    let _ = done.send(Done { seq, bytes, result });
-                });
+            let worker = spawn(Box::new(move || loop {
+                let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok((seq, bytes, done)) = next else { break };
+                let result = worker_result(|| store_chunk(&cache, &objects, &bytes));
+                // The submitter may already have abandoned this file; its
+                // receiver being gone is not an error here.
+                let _ = done.send(Done { seq, bytes, result });
+            }));
             match worker {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -1408,6 +1420,32 @@ mod tests {
         drop(pool);
         drop(held);
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn partial_capture_pool_start_joins_workers_before_releasing_capacity() {
+        for successful_spawns in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let budget = test_budget(3);
+            let finished = Arc::new(AtomicUsize::new(0));
+            let mut attempts = 0;
+            let result =
+                Pool::start_with_spawner(root.path(), root.path(), Arc::clone(&budget), 3, |job| {
+                    if attempts == successful_spawns {
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                    }
+                    attempts += 1;
+                    let finished = Arc::clone(&finished);
+                    thread::Builder::new().spawn(move || {
+                        job();
+                        finished.fetch_add(1, Ordering::Release);
+                    })
+                });
+            assert!(result.is_err());
+            assert_eq!(finished.load(Ordering::Acquire), successful_spawns);
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        }
     }
 
     #[test]
