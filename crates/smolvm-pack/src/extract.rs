@@ -5,6 +5,9 @@
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use ring::digest::{Context, SHA256};
+#[cfg(all(test, target_os = "linux"))]
+#[path = "stream_capture_probe.rs"]
+mod stream_capture_probe;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};

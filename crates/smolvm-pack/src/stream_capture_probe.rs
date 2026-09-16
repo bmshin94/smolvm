@@ -1,0 +1,207 @@
+//! Measurement-only RAM-asset prototype, not a VM checkpoint implementation.
+
+use super::safe_unpack;
+use crate::artifact_writer::ArtifactWriter;
+use crate::assets::ZSTD_LEVEL;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
+use std::time::Instant;
+
+struct ExactStream<R> {
+    source: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for ExactStream<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.remaining.min(buffer.len() as u64) as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        let read = self.source.read(&mut buffer[..count])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short RAM stream",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+#[test]
+fn bounded_stream_rejects_truncation_and_preserves_following_reply() {
+    let mut short = ExactStream {
+        source: &b"short"[..],
+        remaining: 16,
+    };
+    assert_eq!(
+        io::copy(&mut short, &mut io::sink()).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    let mut valid = ExactStream {
+        source: io::Cursor::new(b"RAM!OK saved\n"),
+        remaining: 4,
+    };
+    assert_eq!(io::copy(&mut valid, &mut io::sink()).unwrap(), 4);
+    assert_eq!(valid.source.position(), 4);
+    let mut reply = String::new();
+    valid.source.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "OK saved\n");
+}
+
+fn device_sectors_written() -> u64 {
+    fs::read_to_string("/sys/class/block/nvme0n1/stat")
+        .unwrap()
+        .split_whitespace()
+        .nth(6)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "multi-GiB RAM-asset feasibility measurement; not an end-to-end VM test"]
+fn streamed_memory_asset_roundtrip() {
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let resident = std::env::var("SMOLVM_ASSET_PROBE_MIB")
+        .map(|value| value.parse::<u64>().unwrap())
+        .unwrap_or(1024)
+        * 1024
+        * 1024;
+    assert!(resident > 0);
+    let logical = 4 * resident;
+    let source_path = root.path().join("source-memory");
+    let mut source = File::create(&source_path).unwrap();
+    source.set_len(logical).unwrap();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for block in 0..resident / buffer.len() as u64 {
+        for (index, word) in buffer.chunks_exact_mut(8).enumerate() {
+            // Deterministic, non-cryptographic incompressible synthetic input.
+            let mut x = block * 131072 + index as u64 + 0x9e3779b97f4a7c15;
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+            word.copy_from_slice(&(x ^ (x >> 31)).to_le_bytes());
+        }
+        source.write_all(&buffer).unwrap();
+    }
+    source.sync_all().unwrap();
+    drop(source);
+    for (repetition, order) in [[0, 1, 2], [1, 2, 0], [2, 0, 1]].into_iter().enumerate() {
+        for mode in order {
+            let streaming = mode != 0;
+            let row = tempfile::tempdir_in(root.path()).unwrap();
+            let before = device_sectors_written();
+            let started = Instant::now();
+            let snapshot = row.path().join("memory.bin");
+            let snapshot_ms = if streaming {
+                0
+            } else {
+                let mut output = File::create(&snapshot).unwrap();
+                output.set_len(logical).unwrap();
+                let copied = io::copy(
+                    &mut File::open(&source_path).unwrap().take(resident),
+                    &mut output,
+                )
+                .unwrap();
+                assert_eq!(copied, resident);
+                output.sync_all().unwrap();
+                started.elapsed().as_millis()
+            };
+            let output_path = row.path().join("memory.tar.zst");
+            let writer = ArtifactWriter::create(&output_path, true).unwrap();
+            let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_LEVEL).unwrap();
+            let workers = std::thread::available_parallelism().unwrap().get().min(4);
+            if workers > 1 {
+                encoder.multithread(workers as u32).unwrap();
+            }
+            let mut archive = tar::Builder::new(encoder);
+            if streaming {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(logical);
+                header.set_mode(0o600);
+                if mode == 2 {
+                    // Optimistic floor: this synthetic extent map is already known.
+                    // Real VM extent discovery/transport is NOT measured here.
+                    header.set_entry_type(tar::EntryType::GNUSparse);
+                    header.set_size(resident);
+                    let gnu = header.as_gnu_mut().unwrap();
+                    gnu.set_real_size(logical);
+                    gnu.sparse[0].set_offset(0);
+                    gnu.sparse[0].set_length(resident);
+                    gnu.sparse[1].set_offset(logical);
+                    gnu.sparse[1].set_length(0);
+                }
+                header.set_cksum();
+                let mut input = ExactStream {
+                    source: File::open(&source_path).unwrap(),
+                    remaining: if mode == 2 { resident } else { logical },
+                };
+                archive
+                    .append_data(&mut header, "checkpoint/memory.bin", &mut input)
+                    .unwrap();
+                assert_eq!(input.remaining, 0);
+            } else {
+                archive
+                    .append_path_with_name(&snapshot, "checkpoint/memory.bin")
+                    .unwrap();
+            }
+            let file = archive
+                .into_inner()
+                .unwrap()
+                .finish()
+                .unwrap()
+                .finish()
+                .unwrap();
+            file.sync_all().unwrap();
+            File::open(row.path()).unwrap().sync_all().unwrap();
+            let capture_ms = started.elapsed().as_millis();
+            let captured_sectors = device_sectors_written() - before;
+            let artifact_bytes = file.metadata().unwrap().len();
+            let snapshot_allocated = if streaming {
+                0
+            } else {
+                fs::metadata(&snapshot).unwrap().blocks() * 512
+            };
+            let destination = row.path().join("restored");
+            fs::create_dir(&destination).unwrap();
+            let restore_started = Instant::now();
+            let decoder = zstd::stream::Decoder::new(File::open(&output_path).unwrap()).unwrap();
+            safe_unpack(&mut tar::Archive::new(decoder), &destination).unwrap();
+            let restored_path = destination.join("checkpoint/memory.bin");
+            let restored = File::open(&restored_path).unwrap();
+            restored.sync_all().unwrap();
+            File::open(destination.join("checkpoint"))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            File::open(&destination).unwrap().sync_all().unwrap();
+            let restore_ms = restore_started.elapsed().as_millis();
+            let restored_allocated = restored.metadata().unwrap().blocks() * 512;
+            assert_eq!(restored.metadata().unwrap().len(), logical);
+            assert!(restored_allocated < resident + 64 * 1024 * 1024);
+            let mut actual = restored;
+            let mut expected = File::open(&source_path).unwrap();
+            let mut comparison = vec![0; buffer.len()];
+            let mut offset = 0;
+            while offset < logical {
+                actual.read_exact(&mut buffer).unwrap();
+                expected.read_exact(&mut comparison).unwrap();
+                assert!(buffer == comparison, "RAM mismatch at {offset}");
+                offset += buffer.len() as u64;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"probe":"RAM assets only, not VM checkpoint", "repetition":repetition+1,
+                "mode":(["materialized", "dense_stream", "known_sparse_stream"][mode]),
+                "streaming":streaming, "logical_bytes":logical, "resident_bytes":resident,
+                "snapshot_ms":snapshot_ms, "capture_ms":capture_ms, "restore_ms":restore_ms,
+                "artifact_bytes":artifact_bytes, "snapshot_allocated":snapshot_allocated,
+                "restored_allocated":restored_allocated, "device_capture_write_bytes":captured_sectors*512,
+                "verification":"full logical byte comparison passed"})
+            );
+        }
+    }
+}
