@@ -813,24 +813,25 @@ mod tests {
 
     #[test]
     fn corruption_is_rejected_on_reuse_and_restore() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("cache");
-        let saved = root.path().join("saved");
-        let bytes = vec![7; CHUNK_SIZE];
-        capture(&cache, &saved, &bytes);
-        fs::write(
-            cache.join("objects").join(digest(&bytes)),
+        for corrupt in [
             vec![8; CHUNK_SIZE],
-        )
-        .unwrap();
-        assert!(materialize(&saved, &root.path().join("restore")).is_err());
-        let next = root.path().join("next");
-        fs::create_dir(&next).unwrap();
-        let mut writer = Writer::new(&cache, &next).unwrap();
-        assert!(writer
-            .ingest("memory", bytes.len() as u64, 0o600, &mut bytes.as_slice())
-            .is_err());
-        assert!(!next.join(INDEX).exists());
+            zstd::bulk::compress(&vec![8; CHUNK_SIZE], 3).unwrap(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let saved = root.path().join("saved");
+            let bytes = vec![7; CHUNK_SIZE];
+            capture(&cache, &saved, &bytes);
+            fs::write(cache.join("objects").join(digest(&bytes)), corrupt).unwrap();
+            assert!(materialize(&saved, &root.path().join("restore")).is_err());
+            let next = root.path().join("next");
+            fs::create_dir(&next).unwrap();
+            let mut writer = Writer::new(&cache, &next).unwrap();
+            assert!(writer
+                .ingest("memory", bytes.len() as u64, 0o600, &mut bytes.as_slice())
+                .is_err());
+            assert!(!next.join(INDEX).exists());
+        }
     }
 
     #[test]
