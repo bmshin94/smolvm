@@ -104,30 +104,7 @@ fn sync_object(file: &File) -> io::Result<()> {
     }
 }
 
-/// Confirm a cached object can be reused without reading it.
-///
-/// Objects are content-addressed and immutable: the name is the SHA-256 of the
-/// uncompressed chunk, and an object is published only by renaming a fully
-/// written, fsynced temp file, so a partial one can never appear under its
-/// hash. Verifying content here meant decompressing and re-hashing every
-/// reused chunk on every capture — for a 2 GiB desktop that is ~5 GiB of zstd
-/// and ~5 GiB of SHA-256 per save just to re-confirm objects the store already
-/// vouches for, and it was the bulk of a 41 s incremental save that wrote only
-/// 87 MiB. Restore still verifies every object it reads ([`read_object`]), so
-/// a corrupted object is still caught where it matters; the write path checks
-/// only that the object exists and is a plausibly sized regular file.
-fn object_present(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64
-    {
-        return Err(invalid("checkpoint object type or length mismatch"));
-    }
-    Ok(())
-}
-
-fn read_object(path: &Path, hash: &str, size: usize) -> io::Result<Vec<u8>> {
+fn decode_object(path: &Path, size: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64 {
         return Err(invalid("checkpoint object type or length mismatch"));
@@ -136,10 +113,29 @@ fn read_object(path: &Path, hash: &str, size: usize) -> io::Result<Vec<u8>> {
     let mut decoder = zstd::stream::read::Decoder::new(File::open(path)?)?;
     decoder.window_log_max(23)?;
     decoder.take(size as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() != size || digest(&bytes) != hash {
+    if bytes.len() != size {
         return Err(invalid("checkpoint object checksum mismatch"));
     }
     Ok(bytes)
+}
+
+fn read_object(path: &Path, hash: &str, size: usize) -> io::Result<Vec<u8>> {
+    let bytes = decode_object(path, size)?;
+    if digest(&bytes) != hash {
+        return Err(invalid("checkpoint object checksum mismatch"));
+    }
+    Ok(bytes)
+}
+
+/// Capture already computed the object key from `expected`. Exact byte
+/// equality verifies the existing object against that same input without
+/// hashing it twice. Restore has no trusted input and must use read_object.
+fn verify_object_matches(path: &Path, expected: &[u8]) -> io::Result<()> {
+    let bytes = decode_object(path, expected.len())?;
+    if bytes != expected {
+        return Err(invalid("checkpoint object checksum mismatch"));
+    }
+    Ok(())
 }
 
 /// A capture writes into a private staging directory and publishes it only
@@ -206,8 +202,8 @@ impl Writer {
             } else {
                 let hash = digest(bytes);
                 let cached = self.cache.join(&hash);
-                match object_present(&cached) {
-                    Ok(()) => self.stats.reused_bytes += count as u64,
+                match verify_object_matches(&cached, bytes) {
+                    Ok(_) => self.stats.reused_bytes += count as u64,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         let mut temp = tempfile::Builder::new()
                             .prefix(OBJECT_STAGING_PREFIX)
@@ -221,7 +217,7 @@ impl Writer {
                                 self.stats.new_logical_bytes += count as u64;
                             }
                             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                                object_present(&cached)?;
+                                verify_object_matches(&cached, bytes)?;
                                 self.stats.reused_bytes += count as u64;
                             }
                             Err(error) => return Err(error.error),
@@ -233,7 +229,7 @@ impl Writer {
                 match fs::hard_link(&cached, &linked) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        object_present(&linked)?;
+                        verify_object_matches(&linked, bytes)?;
                     }
                     // Cross-device copies would silently remove the storage
                     // benefit, so require the store and output on one volume.
@@ -793,14 +789,30 @@ mod tests {
         assert_eq!(retry.reused_bytes, CHUNK_SIZE as u64);
     }
 
-    /// Where corruption is caught moved: a capture trusts a present,
-    /// plausibly sized object (re-verifying every reused chunk's content was
-    /// most of an incremental save's cost), and restore — which reads the
-    /// bytes anyway — is where a corrupted object is rejected. A capture that
-    /// reuses such an object therefore succeeds, and it is the restore of it
-    /// that fails closed.
     #[test]
-    fn corruption_is_rejected_on_restore_and_tolerated_on_reuse() {
+    fn reused_objects_require_exact_decoded_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = vec![7; CHUNK_SIZE];
+        let object = root.path().join(digest(&expected));
+        for len in [CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1] {
+            let mut contents = vec![7; len];
+            if len == CHUNK_SIZE {
+                contents[len - 1] = 8;
+            }
+            fs::write(&object, zstd::bulk::compress(&contents, 3).unwrap()).unwrap();
+            assert!(verify_object_matches(&object, &expected).is_err());
+            assert!(read_object(&object, &digest(&expected), expected.len()).is_err());
+        }
+        fs::write(&object, zstd::bulk::compress(&expected, 3).unwrap()).unwrap();
+        verify_object_matches(&object, &expected).unwrap();
+        assert_eq!(
+            read_object(&object, &digest(&expected), expected.len()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn corruption_is_rejected_on_reuse_and_restore() {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("cache");
         let saved = root.path().join("saved");
@@ -813,9 +825,12 @@ mod tests {
         .unwrap();
         assert!(materialize(&saved, &root.path().join("restore")).is_err());
         let next = root.path().join("next");
-        let stats = capture(&cache, &next, &bytes);
-        assert_eq!(stats.reused_bytes, CHUNK_SIZE as u64);
-        assert!(materialize(&next, &root.path().join("restore2")).is_err());
+        fs::create_dir(&next).unwrap();
+        let mut writer = Writer::new(&cache, &next).unwrap();
+        assert!(writer
+            .ingest("memory", bytes.len() as u64, 0o600, &mut bytes.as_slice())
+            .is_err());
+        assert!(!next.join(INDEX).exists());
     }
 
     #[test]
