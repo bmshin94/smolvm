@@ -87,6 +87,29 @@ fn sync_object(file: &File) -> io::Result<()> {
     }
 }
 
+/// Confirm a cached object can be reused without reading it.
+///
+/// Objects are content-addressed and immutable: the name is the SHA-256 of the
+/// uncompressed chunk, and an object is published only by renaming a fully
+/// written, fsynced temp file, so a partial one can never appear under its
+/// hash. Verifying content here meant decompressing and re-hashing every
+/// reused chunk on every capture — for a 2 GiB desktop that is ~5 GiB of zstd
+/// and ~5 GiB of SHA-256 per save just to re-confirm objects the store already
+/// vouches for, and it was the bulk of a 41 s incremental save that wrote only
+/// 87 MiB. Restore still verifies every object it reads ([`read_object`]), so
+/// a corrupted object is still caught where it matters; the write path checks
+/// only that the object exists and is a plausibly sized regular file.
+fn object_present(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64
+    {
+        return Err(invalid("checkpoint object type or length mismatch"));
+    }
+    Ok(())
+}
+
 fn read_object(path: &Path, hash: &str, size: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64 {
@@ -166,8 +189,8 @@ impl Writer {
             } else {
                 let hash = digest(bytes);
                 let cached = self.cache.join(&hash);
-                match read_object(&cached, &hash, count) {
-                    Ok(_) => self.stats.reused_bytes += count as u64,
+                match object_present(&cached) {
+                    Ok(()) => self.stats.reused_bytes += count as u64,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         let mut temp = tempfile::Builder::new()
                             .prefix(OBJECT_STAGING_PREFIX)
@@ -181,7 +204,7 @@ impl Writer {
                                 self.stats.new_logical_bytes += count as u64;
                             }
                             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                                read_object(&cached, &hash, count)?;
+                                object_present(&cached)?;
                                 self.stats.reused_bytes += count as u64;
                             }
                             Err(error) => return Err(error.error),
@@ -193,7 +216,7 @@ impl Writer {
                 match fs::hard_link(&cached, &linked) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        read_object(&linked, &hash, count)?;
+                        object_present(&linked)?;
                     }
                     // Cross-device copies would silently remove the storage
                     // benefit, so require the store and output on one volume.
@@ -654,6 +677,49 @@ mod tests {
         writer.finish(directory, manifest(), vec![file]).unwrap()
     }
 
+    /// Reuse is decided from the object's presence, not by reading it back —
+    /// re-verifying content was most of an incremental save's cost — so the
+    /// one thing the presence check must still refuse is an object that cannot
+    /// be a published one: a zero-length file under a content hash.
+    #[test]
+    fn a_truncated_cached_object_is_refused_rather_than_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let bytes = vec![0x5A; CHUNK_SIZE];
+        let stats = capture(&cache, &root.path().join("first"), &bytes);
+        assert_eq!(stats.new_logical_bytes, CHUNK_SIZE as u64);
+
+        let hash = digest(&bytes);
+        let object = cache.join("objects").join(&hash);
+        assert!(object.is_file(), "object was not published under its hash");
+        fs::write(&object, b"").unwrap();
+
+        let again = root.path().join("second");
+        fs::create_dir(&again).unwrap();
+        let mut writer = Writer::new(&cache, &again).unwrap();
+        let error = writer
+            .ingest(
+                "checkpoint/memory.bin",
+                bytes.len() as u64,
+                0o600,
+                &mut &*bytes,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The positive half: an intact object is reused without being rewritten.
+    #[test]
+    fn an_intact_cached_object_is_reused_without_rewriting() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let bytes = vec![0x5A; CHUNK_SIZE];
+        capture(&cache, &root.path().join("first"), &bytes);
+        let stats = capture(&cache, &root.path().join("second"), &bytes);
+        assert_eq!(stats.reused_bytes, CHUNK_SIZE as u64);
+        assert_eq!(stats.new_bytes, 0);
+    }
+
     #[test]
     fn unchanged_chunks_are_reused_and_old_checkpoints_remain_independent() {
         let root = tempfile::tempdir().unwrap();
@@ -710,8 +776,14 @@ mod tests {
         assert_eq!(retry.reused_bytes, CHUNK_SIZE as u64);
     }
 
+    /// Where corruption is caught moved: a capture trusts a present,
+    /// plausibly sized object (re-verifying every reused chunk's content was
+    /// most of an incremental save's cost), and restore — which reads the
+    /// bytes anyway — is where a corrupted object is rejected. A capture that
+    /// reuses such an object therefore succeeds, and it is the restore of it
+    /// that fails closed.
     #[test]
-    fn corruption_is_rejected_on_reuse_and_restore() {
+    fn corruption_is_rejected_on_restore_and_tolerated_on_reuse() {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("cache");
         let saved = root.path().join("saved");
@@ -724,12 +796,9 @@ mod tests {
         .unwrap();
         assert!(materialize(&saved, &root.path().join("restore")).is_err());
         let next = root.path().join("next");
-        fs::create_dir(&next).unwrap();
-        let mut writer = Writer::new(&cache, &next).unwrap();
-        assert!(writer
-            .ingest("memory", bytes.len() as u64, 0o600, &mut bytes.as_slice())
-            .is_err());
-        assert!(!next.join(INDEX).exists());
+        let stats = capture(&cache, &next, &bytes);
+        assert_eq!(stats.reused_bytes, CHUNK_SIZE as u64);
+        assert!(materialize(&next, &root.path().join("restore2")).is_err());
     }
 
     #[test]
