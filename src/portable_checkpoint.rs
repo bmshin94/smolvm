@@ -233,6 +233,36 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Materialize a stored checkpoint for restore, diffing against the node's
+/// restore base (a pristine clone of whatever restored last) so only changed
+/// chunks are written, then keep a clone of this materialization as the next
+/// base. Both the CLI and the API restore paths go through here so the base
+/// policy lives in one place.
+pub fn materialize_for_restore(artifact: &Path, cache_dir: &Path) -> Result<()> {
+    let base = crate::agent::restore_base_dir();
+    let started = std::time::Instant::now();
+    crate::checkpoint_store::materialize_with_base(artifact, cache_dir, Some(&base))
+        .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
+    let materialized_ms = started.elapsed().as_millis() as u64;
+    let started = std::time::Instant::now();
+    // The fresh materialization is exactly this checkpoint's content, so a
+    // clone of it is the base for whatever restores next.
+    let kept = match crate::checkpoint_store::promote_base(artifact, cache_dir, &base) {
+        Ok(kept) => kept,
+        Err(error) => {
+            tracing::warn!(%error, "restore base not refreshed");
+            false
+        }
+    };
+    tracing::info!(
+        materialized_ms,
+        promote_ms = started.elapsed().as_millis() as u64,
+        base_kept = kept,
+        "checkpoint restore materialized"
+    );
+    Ok(())
+}
+
 pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
     tracing::info!(
         machine = name,
@@ -353,8 +383,7 @@ pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) 
             smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
                 .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
         } else {
-            crate::checkpoint_store::materialize(artifact, &cache_dir)
-                .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
+            materialize_for_restore(artifact, &cache_dir)?;
         }
         log_phase(name, "restore_extract", &mut phase);
         install(&cache_dir, &vm_data, checkpoint)?;

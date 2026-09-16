@@ -798,8 +798,37 @@ pub fn read_manifest(directory: &Path) -> io::Result<PackManifest> {
 /// Restore into a fresh private directory; never map writable VM memory from
 /// an object shared with a retained checkpoint.
 pub fn materialize(directory: &Path, output: &Path) -> io::Result<PackManifest> {
+    materialize_with_base(directory, output, None)
+}
+
+/// Like [`materialize`], but when `base` holds a pristine materialization of
+/// another checkpoint (see [`promote_base`]), every file that exists in both
+/// starts as a clone of the base's copy and only the chunks whose content hash
+/// differs are decoded and written; chunks that became holes are punched out.
+/// A save point typically changes a few MB of a multi-GiB disk, so this turns
+/// a restore from "rewrite everything" into "rewrite the difference". Any file
+/// that cannot be cloned is materialized in full, so a missing or unusable
+/// base only costs speed.
+pub fn materialize_with_base(
+    directory: &Path,
+    output: &Path,
+    base: Option<&Path>,
+) -> io::Result<PackManifest> {
     let index = read_index(directory)?;
+    // Hold the base's shared lock for the whole restore: a concurrent
+    // promotion takes it exclusively, so the files cloned below always belong
+    // to the same base whose index the diff trusts.
+    let _base_guard = base.and_then(|base| lock_base(base, false).ok());
+    let base = match (&_base_guard, base) {
+        (Some(_), Some(base)) => read_index(base)
+            .ok()
+            .map(|index| (base.to_path_buf(), index)),
+        _ => None,
+    };
     fs::create_dir(output)?;
+    let objects = directory.join("objects");
+    let threads = worker_threads();
+    let (mut reused_total, mut written_total) = (0u64, 0u64);
     for entry in &index.files {
         let destination = output.join(&entry.path);
         fs::create_dir_all(
@@ -807,30 +836,285 @@ pub fn materialize(directory: &Path, output: &Path) -> io::Result<PackManifest> 
                 .parent()
                 .ok_or_else(|| invalid("missing asset parent"))?,
         )?;
+        let base_entry = base.as_ref().and_then(|(dir, index)| {
+            index
+                .files
+                .iter()
+                .find(|file| file.path == entry.path)
+                .map(|file| (dir.join(&file.path), file))
+        });
+        let mut cloned = match &base_entry {
+            Some((source, _)) => clone_file(source, &destination)?,
+            None => false,
+        };
+        // A base file whose size disagrees with its index is not the base
+        // the index describes; write this file in full instead.
+        if cloned
+            && fs::metadata(&destination)?.len()
+                != base_entry.as_ref().map_or(0, |(_, base)| base.size)
+        {
+            fs::remove_file(&destination)?;
+            cloned = false;
+        }
         let file = File::options()
             .write(true)
-            .create_new(true)
+            .create_new(!cloned)
             .open(&destination)?;
-        // Size the file first: ranges no worker writes stay holes, exactly as
-        // the sequential seek-over-holes did.
+        // Size the file first: ranges no worker writes stay holes (or keep
+        // the base's bytes, which the diff below has checked are identical).
         file.set_len(entry.size)?;
-        let objects = directory.join("objects");
-        let chunks = entry.chunks.iter().enumerate().filter_map(|(index, hash)| {
-            let offset = index as u64 * CHUNK_SIZE as u64;
-            let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
-            hash.as_ref().map(|hash| (offset, hash, count))
-        });
-        for_each_parallel(worker_threads(), chunks, |(offset, hash, count)| {
-            let bytes = read_object(&objects.join(hash), hash, count)?;
-            write_at(&file, offset, &bytes)
-        })?;
+        let base_chunks: &[Option<String>] = match (&base_entry, cloned) {
+            (Some((_, base)), true) => &base.chunks,
+            _ => &[],
+        };
+        let mut reused = 0u64;
+        let jobs: Vec<(u64, usize, Option<&String>)> = entry
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| {
+                let offset = index as u64 * CHUNK_SIZE as u64;
+                let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
+                let unchanged = base_chunks.get(index).is_some_and(|base| base == hash);
+                if unchanged {
+                    reused += 1;
+                    return None;
+                }
+                match hash {
+                    Some(hash) => Some((offset, count, Some(hash))),
+                    // A hole where the clone still has data must be punched;
+                    // a fresh file is already a hole there.
+                    None if cloned => Some((offset, count, None)),
+                    None => None,
+                }
+            })
+            .collect();
+        let written = jobs.len() as u64;
+        for_each_parallel(
+            threads,
+            jobs.into_iter(),
+            |(offset, count, hash)| match hash {
+                Some(hash) => {
+                    let bytes = read_object(&objects.join(hash), hash, count)?;
+                    write_at(&file, offset, &bytes)
+                }
+                None => punch_hole(&file, offset, count as u64),
+            },
+        )?;
+        reused_total += reused;
+        written_total += written;
+        tracing::debug!(
+            path = %entry.path,
+            cloned,
+            reused_chunks = reused,
+            written_chunks = written,
+            "checkpoint file materialized"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
         }
     }
+    tracing::info!(
+        base = base.is_some(),
+        reused_chunks = reused_total,
+        written_chunks = written_total,
+        "checkpoint materialized"
+    );
     Ok(index.manifest)
+}
+
+/// Keep `materialized` (a fresh, untouched output of [`materialize`] for the
+/// checkpoint at `directory`) as the base the next restore diffs against. The
+/// base is a filesystem clone, so it costs no space until the machine that
+/// shares its blocks diverges, and it is swapped in atomically so a crash
+/// leaves either the old base or the new one. Returns `Ok(false)` where the
+/// filesystem cannot clone; a base is an accelerator, never a requirement.
+pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> io::Result<bool> {
+    let parent = base_root
+        .parent()
+        .ok_or_else(|| invalid("restore base has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let name = base_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("restore base name"))?;
+    // Leftovers of a promotion that died mid-way are safe to drop: the live
+    // base is only ever renamed into place whole.
+    for entry in fs::read_dir(parent)?.flatten() {
+        let stale = entry.file_name();
+        let stale = stale.to_string_lossy();
+        if stale.starts_with(&format!("{name}.new-")) || stale.starts_with(&format!("{name}.old-"))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    let pid = std::process::id();
+    let fresh = parent.join(format!("{name}.new-{pid}"));
+    let old = parent.join(format!("{name}.old-{pid}"));
+    if !clone_tree(materialized, &fresh)? {
+        let _ = fs::remove_dir_all(&fresh);
+        return Ok(false);
+    }
+    fs::copy(directory.join(INDEX), fresh.join(INDEX))?;
+    File::create(fresh.join(BASE_LOCK))?;
+    // Wait for restores that are diffing against the current base, then swap.
+    let _guard = lock_base(base_root, true).ok();
+    match fs::rename(base_root, &old) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = fs::remove_dir_all(&fresh);
+            return Err(error);
+        }
+    }
+    if let Err(error) = fs::rename(&fresh, base_root) {
+        // Another promotion won the race; its base is as good as ours.
+        let _ = fs::remove_dir_all(&fresh);
+        let _ = fs::rename(&old, base_root);
+        return Err(error);
+    }
+    let _ = fs::remove_dir_all(&old);
+    Ok(true)
+}
+
+const BASE_LOCK: &str = ".lock";
+
+/// The base's lock: shared while a restore diffs against it, exclusive while
+/// a promotion swaps it. Fails when there is no base to lock.
+fn lock_base(base_root: &Path, exclusive: bool) -> io::Result<File> {
+    let lock = File::open(base_root.join(BASE_LOCK))?;
+    if exclusive {
+        lock.lock()?;
+    } else {
+        lock.lock_shared()?;
+    }
+    Ok(lock)
+}
+
+/// Clone a whole directory tree without copying payload bytes: one
+/// `clonefile` on macOS, a reflink per file on Linux. `Ok(false)` when the
+/// filesystem cannot reflink (ext4, tmpfs, Windows).
+fn clone_tree(source: &Path, destination: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        clone_path(source, destination)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            let kind = entry.file_type()?;
+            let ok = if kind.is_dir() {
+                clone_tree(&entry.path(), &target)?
+            } else if kind.is_file() {
+                clone_file(&entry.path(), &target)?
+            } else {
+                false
+            };
+            if !ok {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        Ok(false)
+    }
+}
+
+/// Clone one file as a copy-on-write reflink. `Ok(false)` when the
+/// filesystem cannot, with no partial destination left behind.
+fn clone_file(source: &Path, destination: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        clone_path(source, destination)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let Ok(from) = File::open(source) else {
+            return Ok(false);
+        };
+        let to = File::options()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        if unsafe { libc::ioctl(to.as_raw_fd(), FICLONE as _, from.as_raw_fd()) } == 0 {
+            Ok(true)
+        } else {
+            drop(to);
+            let _ = fs::remove_file(destination);
+            Ok(false)
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clone_path(source: &Path, destination: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| invalid("clone source path"))?;
+    let to = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| invalid("clone destination path"))?;
+    if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // Not a clonable pair (different volume, non-APFS, missing source):
+        // the caller materializes in full instead.
+        Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::ENOENT) | Some(libc::EINVAL) => {
+            Ok(false)
+        }
+        _ => Err(error),
+    }
+}
+
+/// Turn `[offset, offset + len)` of a cloned file back into a hole. Falls
+/// back to writing zeros where the filesystem cannot punch.
+fn punch_hole(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let range = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset as libc::off_t,
+            fp_length: len as libc::off_t,
+        };
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &range) } == 0 {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        if unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                mode,
+                offset as libc::off_t,
+                len as libc::off_t,
+            )
+        } == 0
+        {
+            return Ok(());
+        }
+    }
+    write_at(file, offset, &vec![0; len as usize])
 }
 
 pub(crate) fn logical_size(file: &StoredFile) -> u64 {
@@ -961,6 +1245,84 @@ mod tests {
             )
             .unwrap();
         writer.finish(directory, manifest(), vec![file]).unwrap()
+    }
+
+    /// A restore against a base only rewrites the chunks that differ; the
+    /// result must still be exact in both directions (chunks changed, a chunk
+    /// that became a hole, a hole that became data, a file that grew and one
+    /// that shrank). Where the filesystem cannot clone, this degrades to a
+    /// full materialization and must still be exact.
+    #[test]
+    fn restoring_against_a_base_is_exact_in_both_directions() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let base = root.path().join("base");
+        let mut a = Vec::new();
+        for index in 0..16u8 {
+            a.extend(std::iter::repeat_n(index + 1, CHUNK_SIZE));
+        }
+        let mut b = a.clone();
+        b[3 * CHUNK_SIZE..4 * CHUNK_SIZE].fill(0xAB);
+        b[7 * CHUNK_SIZE..8 * CHUNK_SIZE].fill(0);
+        a[12 * CHUNK_SIZE..13 * CHUNK_SIZE].fill(0);
+        b.extend(std::iter::repeat_n(0xCD, CHUNK_SIZE / 2));
+        let saved_a = root.path().join("saved-a");
+        let saved_b = root.path().join("saved-b");
+        capture(&cache, &saved_a, &a);
+        capture(&cache, &saved_b, &b);
+
+        let out_a = root.path().join("out-a");
+        materialize(&saved_a, &out_a).unwrap();
+        let promoted = promote_base(&saved_a, &out_a, &base).unwrap();
+        let out_b = root.path().join("out-b");
+        materialize_with_base(&saved_b, &out_b, Some(&base)).unwrap();
+        assert_eq!(fs::read(out_b.join("checkpoint/memory.bin")).unwrap(), b);
+
+        if promoted {
+            assert!(promote_base(&saved_b, &out_b, &base).unwrap());
+            assert!(base.join(INDEX).is_file());
+            assert!(!base.with_extension("new").exists());
+            assert!(!base.with_extension("old").exists());
+        }
+        let out_a2 = root.path().join("out-a2");
+        materialize_with_base(&saved_a, &out_a2, Some(&base)).unwrap();
+        assert_eq!(fs::read(out_a2.join("checkpoint/memory.bin")).unwrap(), a);
+
+        // A base that is not a checkpoint at all is ignored, not an error.
+        let out_a3 = root.path().join("out-a3");
+        materialize_with_base(&saved_a, &out_a3, Some(&root.path().join("nope"))).unwrap();
+        assert_eq!(fs::read(out_a3.join("checkpoint/memory.bin")).unwrap(), a);
+    }
+
+    /// A base file whose size disagrees with the base index is not trusted:
+    /// that file is written in full and the restore is still exact.
+    #[test]
+    fn a_base_file_of_the_wrong_size_is_written_in_full() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let base = root.path().join("base");
+        let bytes: Vec<u8> = (0..8 * CHUNK_SIZE).map(|i| (i / 977) as u8).collect();
+        let saved = root.path().join("saved");
+        capture(&cache, &saved, &bytes);
+        let out = root.path().join("out");
+        materialize(&saved, &out).unwrap();
+        if !promote_base(&saved, &out, &base).unwrap() {
+            return;
+        }
+        assert!(base.join(BASE_LOCK).is_file());
+        let victim = base.join("checkpoint/memory.bin");
+        File::options()
+            .write(true)
+            .open(&victim)
+            .unwrap()
+            .set_len(3 * CHUNK_SIZE as u64)
+            .unwrap();
+        let again = root.path().join("again");
+        materialize_with_base(&saved, &again, Some(&base)).unwrap();
+        assert_eq!(
+            fs::read(again.join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
     }
 
     /// Restore decodes chunks concurrently; a corrupted object in the middle
