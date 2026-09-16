@@ -106,7 +106,10 @@ fn sync_object(file: &File) -> io::Result<()> {
 
 fn decode_object(path: &Path, size: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64 {
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > (CHUNK_SIZE + 128 * 1024) as u64
+    {
         return Err(invalid("checkpoint object type or length mismatch"));
     }
     let mut bytes = Vec::with_capacity(size);
