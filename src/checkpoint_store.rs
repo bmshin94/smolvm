@@ -16,6 +16,60 @@ const INDEX: &str = "checkpoint.json";
 const CAPTURE_MARKER: &str = ".capture-owner";
 const CAPTURE_MAGIC: &[u8] = b"smolvm-checkpoint-capture-v1\n";
 const OBJECT_STAGING_PREFIX: &str = ".checkpoint-object-";
+const OBJECT_FLUSH_BATCH: usize = 8;
+const OBJECT_FLUSH_STACK: usize = 256 * 1024;
+
+struct PendingObject {
+    temp: tempfile::NamedTempFile,
+    hash: String,
+    // Keep the original bytes for exact verification if another writer wins
+    // publication. At most eight 1 MiB inputs are retained per ingest call.
+    expected: Vec<u8>,
+    compressed_size: usize,
+}
+
+fn sync_pending_objects(
+    pending: &[PendingObject],
+    sync: &(impl Fn(&File) -> io::Result<()> + Sync),
+) -> io::Result<()> {
+    if pending.len() > OBJECT_FLUSH_BATCH {
+        return Err(invalid("checkpoint flush batch exceeds its bound"));
+    }
+    if pending.len() <= 1 {
+        for object in pending {
+            sync(object.temp.as_file())?;
+        }
+        return Ok(());
+    }
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(pending.len());
+        let mut failure = None;
+        for object in pending {
+            match std::thread::Builder::new()
+                .name("checkpoint-flush".into())
+                .stack_size(OBJECT_FLUSH_STACK)
+                .spawn_scoped(scope, || sync(object.temp.as_file()))
+            {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        // Join every started job, including after an error, before dropping
+        // temporary files or allowing the caller to publish any reference.
+        for handle in handles {
+            let result = handle
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("checkpoint flush worker panicked")));
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    })
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +201,7 @@ pub(crate) struct Writer {
     _lock: File,
     cache: std::path::PathBuf,
     objects: std::path::PathBuf,
+    failed: bool,
     pub stats: WriteStats,
 }
 
@@ -178,11 +233,30 @@ impl Writer {
             _lock: lock,
             cache,
             objects,
+            failed: false,
             stats: WriteStats::default(),
         })
     }
 
     pub fn ingest(
+        &mut self,
+        path: &str,
+        size: u64,
+        mode: u32,
+        source: &mut impl Read,
+    ) -> io::Result<StoredFile> {
+        if self.failed {
+            return Err(invalid("checkpoint writer previously failed"));
+        }
+        self.failed = true;
+        let result = self.ingest_inner(path, size, mode, source);
+        if result.is_ok() {
+            self.failed = false;
+        }
+        result
+    }
+
+    fn ingest_inner(
         &mut self,
         path: &str,
         size: u64,
@@ -195,6 +269,7 @@ impl Writer {
         let mut chunks = Vec::new();
         let mut remaining = size;
         let mut buffer = vec![0; CHUNK_SIZE];
+        let mut pending: Vec<PendingObject> = Vec::with_capacity(OBJECT_FLUSH_BATCH);
         while remaining != 0 {
             let count = remaining.min(CHUNK_SIZE as u64) as usize;
             source.read_exact(&mut buffer[..count])?;
@@ -205,49 +280,85 @@ impl Writer {
             } else {
                 let hash = digest(bytes);
                 let cached = self.cache.join(&hash);
+                if let Some(object) = pending.iter().find(|object| object.hash == hash) {
+                    if object.expected != bytes {
+                        return Err(invalid("checkpoint object checksum mismatch"));
+                    }
+                    self.stats.reused_bytes += count as u64;
+                    chunks.push(Some(hash));
+                    remaining -= count as u64;
+                    continue;
+                }
                 match verify_object_matches(&cached, bytes) {
-                    Ok(_) => self.stats.reused_bytes += count as u64,
+                    Ok(_) => {
+                        self.stats.reused_bytes += count as u64;
+                        self.link_object(&hash, bytes)?;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         let mut temp = tempfile::Builder::new()
                             .prefix(OBJECT_STAGING_PREFIX)
                             .tempfile_in(&self.cache)?;
                         let compressed = zstd::bulk::compress(bytes, 3)?;
                         temp.write_all(&compressed)?;
-                        sync_object(temp.as_file())?;
-                        match temp.persist_noclobber(&cached) {
-                            Ok(_) => {
-                                self.stats.new_bytes += compressed.len() as u64;
-                                self.stats.new_logical_bytes += count as u64;
-                            }
-                            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                                verify_object_matches(&cached, bytes)?;
-                                self.stats.reused_bytes += count as u64;
-                            }
-                            Err(error) => return Err(error.error),
+                        pending.push(PendingObject {
+                            temp,
+                            hash: hash.clone(),
+                            expected: bytes.to_vec(),
+                            compressed_size: compressed.len(),
+                        });
+                        if pending.len() == OBJECT_FLUSH_BATCH {
+                            self.flush_pending(&mut pending, &sync_object)?;
                         }
                     }
-                    Err(error) => return Err(error),
-                }
-                let linked = self.objects.join(&hash);
-                match fs::hard_link(&cached, &linked) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        verify_object_matches(&linked, bytes)?;
-                    }
-                    // Cross-device copies would silently remove the storage
-                    // benefit, so require the store and output on one volume.
                     Err(error) => return Err(error),
                 }
                 chunks.push(Some(hash));
             }
             remaining -= count as u64;
         }
+        self.flush_pending(&mut pending, &sync_object)?;
         Ok(StoredFile {
             path: path.into(),
             size,
             mode: mode & 0o777,
             chunks,
         })
+    }
+
+    fn link_object(&self, hash: &str, expected: &[u8]) -> io::Result<()> {
+        let linked = self.objects.join(hash);
+        match fs::hard_link(self.cache.join(hash), &linked) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                verify_object_matches(&linked, expected)
+            }
+            // No cross-device copy fallback: every checkpoint owns its links.
+            Err(error) => Err(error),
+        }
+    }
+
+    fn flush_pending(
+        &mut self,
+        pending: &mut Vec<PendingObject>,
+        sync: &(impl Fn(&File) -> io::Result<()> + Sync),
+    ) -> io::Result<()> {
+        sync_pending_objects(pending, sync)?;
+        for object in pending.drain(..) {
+            let cached = self.cache.join(&object.hash);
+            match object.temp.persist_noclobber(&cached) {
+                Ok(_) => {
+                    self.stats.new_bytes += object.compressed_size as u64;
+                    self.stats.new_logical_bytes += object.expected.len() as u64;
+                }
+                Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                    verify_object_matches(&cached, &object.expected)?;
+                    self.stats.reused_bytes += object.expected.len() as u64;
+                }
+                Err(error) => return Err(error.error),
+            }
+            self.link_object(&object.hash, &object.expected)?;
+        }
+        Ok(())
     }
 
     /// Consume the libkrun stream before accepting its final success response.
@@ -370,6 +481,9 @@ impl Writer {
         manifest: PackManifest,
         files: Vec<StoredFile>,
     ) -> io::Result<WriteStats> {
+        if self.failed {
+            return Err(invalid("cannot finish a failed checkpoint writer"));
+        }
         let index = Index {
             version: VERSION,
             chunk_size: CHUNK_SIZE,
@@ -693,10 +807,7 @@ mod tests {
         writer.finish(directory, manifest(), vec![file]).unwrap()
     }
 
-    /// Reuse is decided from the object's presence, not by reading it back —
-    /// re-verifying content was most of an incremental save's cost — so the
-    /// one thing the presence check must still refuse is an object that cannot
-    /// be a published one: a zero-length file under a content hash.
+    /// Cached objects must contain the exact original bytes before reuse.
     #[test]
     fn a_truncated_cached_object_is_refused_rather_than_reused() {
         let root = tempfile::tempdir().unwrap();
@@ -787,9 +898,211 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert!(!incomplete.join(INDEX).exists());
+        assert!(writer.finish(&incomplete, manifest(), vec![]).is_err());
+        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 0);
         let retry = capture(&cache, &root.path().join("retry"), &vec![1; CHUNK_SIZE]);
-        assert_eq!(retry.new_bytes, 0);
-        assert_eq!(retry.reused_bytes, CHUNK_SIZE as u64);
+        // An incomplete batch stays private and is discarded on input error.
+        assert!(retry.new_bytes > 0);
+        assert_eq!(retry.reused_bytes, 0);
+    }
+
+    fn pending_objects(writer: &Writer, count: usize) -> Vec<PendingObject> {
+        (0..count)
+            .map(|index| {
+                let expected = vec![index as u8 + 1; CHUNK_SIZE];
+                let compressed = zstd::bulk::compress(&expected, 3).unwrap();
+                let mut temp = tempfile::Builder::new()
+                    .prefix(OBJECT_STAGING_PREFIX)
+                    .tempfile_in(&writer.cache)
+                    .unwrap();
+                temp.write_all(&compressed).unwrap();
+                PendingObject {
+                    temp,
+                    hash: digest(&expected),
+                    expected,
+                    compressed_size: compressed.len(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flush_batches_remain_private_until_every_job_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved");
+        fs::create_dir(&saved).unwrap();
+        let mut writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+        let mut pending = pending_objects(&writer, OBJECT_FLUSH_BATCH);
+        let entered = AtomicUsize::new(0);
+        let cache = writer.cache.clone();
+        writer
+            .flush_pending(&mut pending, &|file| {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while entered.load(Ordering::SeqCst) != OBJECT_FLUSH_BATCH {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "flush jobs did not overlap",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert_eq!(fs::read_dir(saved.join("objects")).unwrap().count(), 0);
+                assert!(fs::read_dir(&cache).unwrap().all(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(OBJECT_STAGING_PREFIX)));
+                sync_object(file)
+            })
+            .unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(
+            fs::read_dir(saved.join("objects")).unwrap().count(),
+            OBJECT_FLUSH_BATCH
+        );
+        assert_eq!(
+            writer.stats.new_logical_bytes,
+            (OBJECT_FLUSH_BATCH * CHUNK_SIZE) as u64
+        );
+    }
+
+    #[test]
+    fn flush_failure_joins_all_jobs_and_publishes_no_objects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for panic_worker in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let saved = root.path().join("saved");
+            fs::create_dir(&saved).unwrap();
+            let mut writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+            let mut pending = pending_objects(&writer, OBJECT_FLUSH_BATCH);
+            let calls = AtomicUsize::new(0);
+            let completed = AtomicUsize::new(0);
+            let result = writer.flush_pending(&mut pending, &|file| {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    if panic_worker {
+                        panic!("injected checkpoint flush panic");
+                    }
+                    return Err(io::Error::other("injected checkpoint flush failure"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                sync_object(file)?;
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), OBJECT_FLUSH_BATCH);
+            assert_eq!(completed.load(Ordering::SeqCst), OBJECT_FLUSH_BATCH - 1);
+            assert_eq!(fs::read_dir(saved.join("objects")).unwrap().count(), 0);
+            assert!(!saved.join(INDEX).exists());
+            drop(pending);
+            assert_eq!(fs::read_dir(&writer.cache).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_publication_is_verified_against_original_bytes() {
+        for corrupt in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let saved = root.path().join("saved");
+            fs::create_dir(&saved).unwrap();
+            let mut writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+            let mut pending = pending_objects(&writer, 2);
+            let winner = writer.cache.join(&pending[0].hash);
+            let mut bytes = pending[0].expected.clone();
+            if corrupt {
+                bytes[CHUNK_SIZE - 1] ^= 1;
+            }
+            fs::write(&winner, zstd::bulk::compress(&bytes, 3).unwrap()).unwrap();
+            File::open(&winner).unwrap().sync_all().unwrap();
+            let result = writer.flush_pending(&mut pending, &sync_object);
+            assert_eq!(result.is_err(), corrupt);
+            if corrupt {
+                assert!(!saved.join(INDEX).exists());
+                assert_eq!(fs::read_dir(saved.join("objects")).unwrap().count(), 0);
+            } else {
+                assert_eq!(writer.stats.reused_bytes, CHUNK_SIZE as u64);
+                assert_eq!(writer.stats.new_logical_bytes, CHUNK_SIZE as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn full_and_partial_flush_batches_preserve_duplicates_and_zeros() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved");
+        let mut bytes = vec![0; (2 * OBJECT_FLUSH_BATCH + 3) * CHUNK_SIZE + 17];
+        for (index, chunk) in bytes.chunks_mut(CHUNK_SIZE).enumerate() {
+            chunk.fill(index as u8 + 1);
+        }
+        bytes[2 * CHUNK_SIZE..3 * CHUNK_SIZE].fill(1);
+        bytes[4 * CHUNK_SIZE..5 * CHUNK_SIZE].fill(0);
+        let stats = capture(&root.path().join("cache"), &saved, &bytes);
+        assert_eq!(stats.reused_bytes, CHUNK_SIZE as u64);
+        assert_eq!(stats.zero_bytes, CHUNK_SIZE as u64);
+        materialize(&saved, &root.path().join("restored")).unwrap();
+        assert_eq!(
+            fs::read(root.path().join("restored/checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn interrupted_later_batch_keeps_only_previously_durable_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let incomplete = root.path().join("incomplete");
+        fs::create_dir(&incomplete).unwrap();
+        let mut writer = Writer::new(&cache, &incomplete).unwrap();
+        let mut bytes = vec![0; (OBJECT_FLUSH_BATCH + 2) * CHUNK_SIZE];
+        for (index, chunk) in bytes.chunks_mut(CHUNK_SIZE).enumerate() {
+            chunk.fill(index as u8 + 1);
+        }
+        assert_eq!(
+            writer
+                .ingest(
+                    "memory",
+                    bytes.len() as u64 + 1,
+                    0o600,
+                    &mut bytes.as_slice()
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(writer.finish(&incomplete, manifest(), vec![]).is_err());
+        assert!(!incomplete.join(INDEX).exists());
+        assert_eq!(
+            fs::read_dir(&writer.cache).unwrap().count(),
+            OBJECT_FLUSH_BATCH
+        );
+        assert_eq!(
+            fs::read_dir(&writer.objects).unwrap().count(),
+            OBJECT_FLUSH_BATCH
+        );
+        drop(writer);
+        let retry = root.path().join("retry");
+        let stats = capture(&cache, &retry, &bytes);
+        assert_eq!(stats.reused_bytes, (OBJECT_FLUSH_BATCH * CHUNK_SIZE) as u64);
+        assert_eq!(stats.new_logical_bytes, (2 * CHUNK_SIZE) as u64);
+        materialize(&retry, &root.path().join("restored")).unwrap();
+        assert_eq!(
+            fs::read(root.path().join("restored/checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn oversized_flush_batch_starts_no_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved");
+        fs::create_dir(&saved).unwrap();
+        let writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+        let pending = pending_objects(&writer, OBJECT_FLUSH_BATCH + 1);
+        assert!(sync_pending_objects(&pending, &|_| panic!("unbounded job started")).is_err());
     }
 
     #[test]
