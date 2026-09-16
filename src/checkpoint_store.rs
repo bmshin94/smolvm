@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -186,7 +187,7 @@ impl Writer {
                 ));
             }
         }
-        let pool = Pool::start(&cache, &objects);
+        let pool = Pool::start(&cache, &objects)?;
         Ok(Self {
             _lock: lock,
             cache,
@@ -476,43 +477,121 @@ struct Pool {
     /// Chunks in flight per file: enough to keep every worker busy while the
     /// reader refills, small enough that buffers stay at a few dozen MiB.
     window: usize,
+    inline_paths: (std::path::PathBuf, std::path::PathBuf),
+    // Released only after Drop has joined every worker.
+    _permit: WorkerPermit,
 }
 
 impl Pool {
-    fn start(cache: &Path, objects: &Path) -> Self {
-        let threads = worker_threads();
-        let window = threads * 2;
+    fn start(cache: &Path, objects: &Path) -> io::Result<Self> {
+        Self::start_with_budget(cache, objects, process_worker_budget())
+    }
+
+    fn start_with_budget(
+        cache: &Path,
+        objects: &Path,
+        budget: Arc<WorkerBudget>,
+    ) -> io::Result<Self> {
+        let permit = budget.acquire(worker_threads());
+        let threads = permit.count;
+        let window = (threads * 2).max(1);
         let (jobs, receiver) = mpsc::sync_channel::<Submission>(window);
         let receiver = Arc::new(Mutex::new(receiver));
-        let workers = (0..threads)
-            .map(|_| {
-                let receiver = Arc::clone(&receiver);
-                let cache = cache.to_path_buf();
-                let objects = objects.to_path_buf();
-                thread::spawn(move || loop {
+        let mut workers = Vec::new();
+        for _ in 0..threads {
+            let receiver = Arc::clone(&receiver);
+            let cache = cache.to_path_buf();
+            let objects = objects.to_path_buf();
+            let worker = thread::Builder::new()
+                .name("checkpoint-store".into())
+                .spawn(move || loop {
                     let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok((seq, bytes, done)) = next else { break };
-                    let result = store_chunk(&cache, &objects, &bytes);
+                    let result = worker_result(|| store_chunk(&cache, &objects, &bytes));
                     // The submitter may already have abandoned this file; its
                     // receiver being gone is not an error here.
                     let _ = done.send(Done { seq, bytes, result });
-                })
-            })
-            .collect();
-        Self {
-            jobs: Some(jobs),
+                });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    drop(jobs);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self {
+            jobs: (threads != 0).then_some(jobs),
             workers,
             window,
-        }
+            inline_paths: (cache.to_path_buf(), objects.to_path_buf()),
+            _permit: permit,
+        })
     }
 
     fn submit(&self, seq: usize, bytes: Vec<u8>, done: mpsc::Sender<Done>) -> Result<(), ()> {
+        if self.workers.is_empty() {
+            let result =
+                worker_result(|| store_chunk(&self.inline_paths.0, &self.inline_paths.1, &bytes));
+            return done.send(Done { seq, bytes, result }).map_err(|_| ());
+        }
         self.jobs
             .as_ref()
             .expect("pool sender lives until drop")
             .send((seq, bytes, done))
             .map_err(|_| ())
     }
+}
+
+// Capture and restore share this budget. Contended operations run on their
+// existing caller thread instead of waiting for another capture to finish.
+struct WorkerBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl WorkerBudget {
+    fn acquire(self: &Arc<Self>, requested: usize) -> WorkerPermit {
+        let previous = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used + requested.min(self.limit.saturating_sub(used)))
+            })
+            .expect("worker reservation always supplies a value");
+        WorkerPermit {
+            count: requested.min(self.limit.saturating_sub(previous)),
+            budget: Arc::clone(self),
+        }
+    }
+}
+
+struct WorkerPermit {
+    count: usize,
+    budget: Arc<WorkerBudget>,
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.count, Ordering::AcqRel);
+    }
+}
+
+fn process_worker_budget() -> Arc<WorkerBudget> {
+    static BUDGET: OnceLock<Arc<WorkerBudget>> = OnceLock::new();
+    Arc::clone(BUDGET.get_or_init(|| {
+        Arc::new(WorkerBudget {
+            limit: worker_threads(),
+            used: AtomicUsize::new(0),
+        })
+    }))
+}
+
+fn worker_result<T>(work: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(io::Error::other("checkpoint worker panicked")))
 }
 
 /// Worker threads for chunk work: one per core unless `SMOLVM_CHECKPOINT_THREADS`
@@ -538,25 +617,48 @@ fn for_each_parallel<J: Send>(
     jobs: impl Iterator<Item = J>,
     work: impl Fn(J) -> io::Result<()> + Sync,
 ) -> io::Result<()> {
+    for_each_with_budget(threads, jobs, work, process_worker_budget())
+}
+
+fn for_each_with_budget<J: Send>(
+    requested: usize,
+    mut jobs: impl Iterator<Item = J>,
+    work: impl Fn(J) -> io::Result<()> + Sync,
+    budget: Arc<WorkerBudget>,
+) -> io::Result<()> {
+    let permit = budget.acquire(requested);
+    let threads = permit.count;
+    if threads == 0 {
+        return jobs.try_for_each(|job| worker_result(|| work(job)));
+    }
     let failure: Mutex<Option<io::Error>> = Mutex::new(None);
     let failed = || failure.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     let (sender, receiver) = mpsc::sync_channel::<J>(threads * 2);
     let receiver = Mutex::new(receiver);
     thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| loop {
-                let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok(job) = job else { break };
-                if failed() {
-                    continue;
-                }
-                if let Err(error) = work(job) {
-                    failure
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_or_insert(error);
-                }
-            });
+            let spawned = thread::Builder::new()
+                .name("checkpoint-restore".into())
+                .spawn_scoped(scope, || loop {
+                    let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(job) = job else { break };
+                    if failed() {
+                        continue;
+                    }
+                    if let Err(error) = worker_result(|| work(job)) {
+                        failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(error);
+                    }
+                });
+            if let Err(error) = spawned {
+                failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(error);
+                break;
+            }
         }
         for job in jobs {
             if failed() || sender.send(job).is_err() {
@@ -1192,6 +1294,121 @@ pub fn export(directory: &Path, output: &Path) -> io::Result<u64> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    fn test_budget(limit: usize) -> Arc<WorkerBudget> {
+        Arc::new(WorkerBudget {
+            limit,
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    #[test]
+    fn checkpoint_worker_reservations_share_a_process_bound() {
+        let budget = test_budget(3);
+        let first = budget.acquire(2);
+        let second = budget.acquire(2);
+        assert_eq!((first.count, second.count), (2, 1));
+        assert_eq!(budget.acquire(32).count, 0);
+        drop(first);
+        assert_eq!(budget.used.load(Ordering::Acquire), 1);
+        drop(second);
+        let start = std::sync::Barrier::new(16);
+        thread::scope(|scope| {
+            for _ in 0..16 {
+                let budget = Arc::clone(&budget);
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..1000 {
+                        let permit = budget.acquire(2);
+                        assert!(permit.count <= 2);
+                        assert!(budget.used.load(Ordering::Acquire) <= 3);
+                        thread::yield_now();
+                    }
+                });
+            }
+        });
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn restore_uses_caller_when_capture_holds_worker_budget() {
+        let budget = test_budget(2);
+        let held = budget.acquire(2);
+        let caller = thread::current().id();
+        let count = AtomicUsize::new(0);
+        for_each_with_budget(
+            2,
+            0..16,
+            |_| {
+                assert_eq!(thread::current().id(), caller);
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 16);
+        assert_eq!(budget.used.load(Ordering::Acquire), 2);
+        drop(held);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_parallel_work_releases_worker_budget() {
+        for panic in [false, true] {
+            let budget = test_budget(2);
+            let result = for_each_with_budget(
+                2,
+                0..16,
+                |_| {
+                    if panic {
+                        panic!("injected worker failure");
+                    }
+                    Err(io::Error::other("injected I/O failure"))
+                },
+                Arc::clone(&budget),
+            );
+            assert!(result.is_err());
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            for_each_with_budget(2, 0..4, |_| Ok(()), Arc::clone(&budget)).unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_pool_falls_back_without_losing_checks_or_results() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let objects = root.path().join("objects");
+        fs::create_dir(&cache).unwrap();
+        fs::create_dir(&objects).unwrap();
+        let budget = test_budget(2);
+        let held = budget.acquire(2);
+        let pool = Pool::start_with_budget(&cache, &objects, Arc::clone(&budget)).unwrap();
+        assert!(pool.workers.is_empty());
+        assert_eq!(pool.window, 1);
+        let bytes = vec![31; CHUNK_SIZE];
+        let hash = digest(&bytes);
+        let (done, results) = mpsc::channel();
+        pool.submit(7, bytes.clone(), done).unwrap();
+        let result = results
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(result.seq, 7);
+        assert_eq!(result.result.unwrap().0, Some(hash.clone()));
+        verify_object_matches(&objects.join(&hash), &bytes).unwrap();
+        fs::write(cache.join(&hash), b"invalid compressed object").unwrap();
+        let (done, results) = mpsc::channel();
+        pool.submit(8, bytes, done).unwrap();
+        assert!(results
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .result
+            .is_err());
+        drop(pool);
+        drop(held);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     #[cfg(unix)]
