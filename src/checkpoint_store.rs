@@ -940,6 +940,10 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("restore base name"))?;
+    // Lock outside the replaceable directory, before inspecting or removing
+    // staging paths. Otherwise a second promotion can delete a live staging
+    // directory, or a reader can hold an obsolete generation's lock.
+    let _guard = lock_base(base_root, true)?;
     // Leftovers of a promotion that died mid-way are safe to drop: the live
     // base is only ever renamed into place whole.
     for entry in fs::read_dir(parent)?.flatten() {
@@ -959,8 +963,7 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
     }
     fs::copy(directory.join(INDEX), fresh.join(INDEX))?;
     File::create(fresh.join(BASE_LOCK))?;
-    // Wait for restores that are diffing against the current base, then swap.
-    let _guard = lock_base(base_root, true).ok();
+    // The stable exclusive lock also covers publication and old-base cleanup.
     match fs::rename(base_root, &old) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -981,10 +984,22 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
 
 const BASE_LOCK: &str = ".lock";
 
-/// The base's lock: shared while a restore diffs against it, exclusive while
-/// a promotion swaps it. Fails when there is no base to lock.
+/// Shared while a restore diffs against the base, exclusive throughout
+/// promotion. This sibling inode must never be renamed or deleted with a base.
 fn lock_base(base_root: &Path, exclusive: bool) -> io::Result<File> {
-    let lock = File::open(base_root.join(BASE_LOCK))?;
+    let mut name = base_root
+        .file_name()
+        .ok_or_else(|| invalid("restore base name"))?
+        .to_os_string();
+    name.push(".lock");
+    let mut options = File::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options.open(base_root.with_file_name(name))?;
     if exclusive {
         lock.lock()?;
     } else {
@@ -1191,6 +1206,65 @@ pub fn export(directory: &Path, output: &Path) -> io::Result<u64> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    #[test]
+    fn replacing_restore_base_keeps_the_same_lock_domain() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        fs::create_dir(&base).unwrap();
+        File::create(base.join(BASE_LOCK)).unwrap();
+        let held = lock_base(&base, false).unwrap();
+        fs::rename(&base, root.path().join("old")).unwrap();
+        fs::create_dir(&base).unwrap();
+        File::create(base.join(BASE_LOCK)).unwrap();
+        let next = lock_base(&base, false).unwrap();
+        assert!(
+            next.try_lock().is_err(),
+            "a replaced base bypassed an active reader's lock"
+        );
+        drop(held);
+        next.try_lock().unwrap();
+    }
+
+    #[test]
+    fn simultaneous_base_promotions_preserve_restore_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let base = root.path().join("base");
+        let sources: Vec<_> = (0..4)
+            .map(|index| {
+                let bytes = vec![index as u8 + 1; CHUNK_SIZE + 17];
+                let saved = root.path().join(format!("saved-{index}"));
+                capture(&cache, &saved, &bytes);
+                let output = root.path().join(format!("initial-{index}"));
+                materialize(&saved, &output).unwrap();
+                (saved, output, bytes)
+            })
+            .collect();
+        let supported = promote_base(&sources[0].0, &sources[0].1, &base).unwrap();
+        if std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_some() {
+            assert!(supported, "this QA gate requires real reflink support");
+        }
+        if !supported {
+            return;
+        }
+        std::thread::scope(|scope| {
+            for (index, (saved, initial, bytes)) in sources.iter().enumerate() {
+                let base = &base;
+                let root = root.path();
+                scope.spawn(move || {
+                    for repetition in 0..10 {
+                        assert!(promote_base(saved, initial, base).unwrap());
+                        let output = root.join(format!("output-{index}-{repetition}"));
+                        materialize_with_base(saved, &output, Some(base)).unwrap();
+                        assert_eq!(
+                            fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+                            *bytes
+                        );
+                    }
+                });
+            }
+        });
+    }
     use super::*;
 
     #[test]
