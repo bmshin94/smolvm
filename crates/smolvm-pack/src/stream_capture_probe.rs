@@ -63,13 +63,27 @@ fn device_sectors_written() -> u64 {
 }
 
 fn scan_extents(reader: &mut impl Read, logical: u64) -> io::Result<Vec<(u64, u64)>> {
+    scan_extents_with(reader, logical, false)
+}
+
+fn scan_extents_with(
+    reader: &mut impl Read,
+    logical: u64,
+    bulk_compare: bool,
+) -> io::Result<Vec<(u64, u64)>> {
+    static ZERO: [u8; 65536] = [0; 65536];
     let mut buffer = [0_u8; 65536];
     let mut extents: Vec<(u64, u64)> = Vec::new();
     let mut offset = 0;
     while offset < logical {
         let count = (logical - offset).min(buffer.len() as u64) as usize;
         reader.read_exact(&mut buffer[..count])?;
-        if buffer[..count].iter().any(|byte| *byte != 0) {
+        let nonzero = if bulk_compare {
+            buffer[..count] != ZERO[..count]
+        } else {
+            buffer[..count].iter().any(|byte| *byte != 0)
+        };
+        if nonzero {
             match extents.last_mut() {
                 Some((start, len)) if *start + *len == offset => *len += count as u64,
                 _ => {
@@ -84,6 +98,30 @@ fn scan_extents(reader: &mut impl Read, logical: u64) -> io::Result<Vec<(u64, u6
     }
     extents.push((logical, 0));
     Ok(extents)
+}
+
+#[test]
+#[ignore = "CPU-only zero-scan comparison, not a checkpoint benchmark"]
+fn zero_scan_cost_comparison() {
+    let mut bytes = vec![0_u8; 64 * 1024 * 1024];
+    bytes[0] = 7;
+    let expected = vec![(0, 65536), (bytes.len() as u64, 0)];
+    for order in [[false, true], [true, false], [false, true]] {
+        for bulk in order {
+            let start = Instant::now();
+            for _ in 0..64 {
+                let mut source = io::Cursor::new(std::hint::black_box(&bytes));
+                assert_eq!(
+                    scan_extents_with(&mut source, bytes.len() as u64, bulk).unwrap(),
+                    expected
+                );
+            }
+            println!(
+                "{}",
+                serde_json::json!({"probe":"CPU-only 4 GiB zero scanning", "bulk_compare":bulk, "elapsed_ms":start.elapsed().as_millis()})
+            );
+        }
+    }
 }
 
 fn append_sparse<W: Write>(
