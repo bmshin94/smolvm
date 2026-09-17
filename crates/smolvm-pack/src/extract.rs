@@ -311,23 +311,26 @@ const WHITEOUT_MODE: u32 = 0o020000;
 /// virtiofs server that honors the xattr (libkrun's macOS and Windows
 /// servers do; Linux once its passthrough gains the same), a pack whose agent
 /// mounts with `userxattr`, and a cache filesystem that stores user xattrs.
-/// `SMOLVM_HOST_LAYERS=on|off` overrides the platform and version checks.
+/// `SMOLVM_HOST_LAYERS=on` waives the pack-version check (for packs built before
+/// the threshold); `off` disables the path; neither bypasses the server check.
 fn host_layers_via_override_stat(pack_version: Option<&str>, cache_dir: &Path) -> bool {
     let server_honors_override = || {
         cfg!(any(target_os = "macos", target_os = "windows"))
             || HOST_LAYERS_PROBE.get().is_some_and(|probe| probe())
     };
+    // The override can only relax the pack-version check: a server that
+    // cannot present the xattr would show every file as the host's user.
     match std::env::var("SMOLVM_HOST_LAYERS").ok().as_deref() {
         Some("off") => return false,
         Some("on") => {}
         _ => {
-            if !server_honors_override() {
-                return false;
-            }
             if !pack_version.is_some_and(packed_agent_mounts_userxattr) {
                 return false;
             }
         }
+    }
+    if !server_honors_override() {
+        return false;
     }
     // A root Linux host without the uid drop already reproduces owners on
     // disk; nothing to fake there.
