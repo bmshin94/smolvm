@@ -16,6 +16,10 @@ name: Build libkrun (linux, glibc 2.35)
 on:
   workflow_dispatch:
     inputs:
+      macos_runtime_run:
+        description: "Build only the macOS QA engine using the runtime artifact from this workflow run ID."
+        type: string
+        default: ""
       macos_only:
         description: "Build only the macOS runtime bundle."
         type: boolean
@@ -27,7 +31,7 @@ on:
 
 jobs:
   build:
-    if: ${{ !inputs.macos_only }}
+    if: ${{ !inputs.macos_only && inputs.macos_runtime_run == '' }}
     name: libkrun ${{ matrix.arch }}
     strategy:
       fail-fast: false
@@ -86,7 +90,7 @@ jobs:
   # must still match the pin so an unrelated release cannot silently retain an
   # older runtime.
   windows-libkrun:
-    if: ${{ !inputs.macos_only }}
+    if: ${{ !inputs.macos_only && inputs.macos_runtime_run == '' }}
     name: libkrun windows-x86_64
     runs-on: ubuntu-22.04
     env:
@@ -126,7 +130,7 @@ jobs:
   # runs when refreshing libkrunfw, since the .dll wraps the guest kernel.
   windows-libkrunfw:
     name: libkrunfw.dll (windows cross)
-    if: ${{ inputs.rebuild_libkrunfw && !inputs.macos_only }}
+    if: ${{ inputs.rebuild_libkrunfw && !inputs.macos_only && inputs.macos_runtime_run == '' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -156,7 +160,7 @@ jobs:
 
   macos-libkrun:
     name: libkrun darwin-arm64
-    if: ${{ inputs.macos_only }}
+    if: ${{ inputs.macos_only && inputs.macos_runtime_run == '' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -201,4 +205,48 @@ jobs:
           path: |
             lib/libkrun.dylib
             lib/libkrun.provenance
+          if-no-files-found: error
+
+  macos-engine-qa:
+    name: Checkpoint engine darwin-arm64
+    if: ${{ inputs.macos_runtime_run != '' }}
+    runs-on: macos-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libkrun-darwin-arm64
+          run-id: ${{ inputs.macos_runtime_run }}
+          github-token: ${{ github.token }}
+          path: lib
+
+      - name: Verify the runtime source and signature
+        run: |
+          grep -Fx "libkrun=$(git rev-parse HEAD:libkrun)" lib/libkrun.provenance
+          grep -Fx "libkrunfw=$(git rev-parse HEAD:libkrunfw)" lib/libkrun.provenance
+          codesign --verify --strict --verbose=2 lib/libkrun.dylib
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and sign the acceptance engine
+        env:
+          LIBRARY_PATH: ${{ github.workspace }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
+        run: |
+          cargo build --locked --release --bin smolvm
+          codesign --force --sign - --entitlements smolvm.entitlements target/release/smolvm
+          codesign --verify --strict --verbose=2 target/release/smolvm
+          target/release/smolvm --version
+          shasum -a 256 target/release/smolvm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-engine-darwin-arm64
+          path: target/release/smolvm
           if-no-files-found: error
