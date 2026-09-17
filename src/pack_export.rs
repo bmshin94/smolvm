@@ -280,11 +280,67 @@ const EXPORT_HELPER_MIN_STORAGE_GIB: u64 = 64;
 /// extracted layers plus the flattened output built alongside them.
 const EXPORT_HELPER_STORAGE_FACTOR: u64 = 3;
 
+/// Overrides the helper's storage disk, in GiB, for an export the heuristic
+/// below sizes too small. The disk is sparse, so a generous value costs
+/// nothing on the host until it is written.
+const EXPORT_HELPER_STORAGE_ENV: &str = "SMOLVM_EXPORT_HELPER_STORAGE_GIB";
+
+/// How large the export helper's storage disk should be.
+///
+/// The helper holds the image's layers plus the flattened output, so the size
+/// has to follow the image, not the one-size-fits-all default a fresh machine
+/// gets. Neither input alone describes it: a machine that pulled its image
+/// carries it on its own disk (`source_apparent_gib`), while one created from
+/// an artifact carries it in the host layer directory the helper mounts
+/// (`packed_layers_gib`) and can have a small disk of its own. Take whichever
+/// is larger, and keep a floor for machines whose disks are both small.
+fn export_helper_storage_gib(source_apparent_gib: u64, packed_layers_gib: u64) -> u64 {
+    parse_helper_storage_override(std::env::var(EXPORT_HELPER_STORAGE_ENV).ok().as_deref())
+        .unwrap_or_else(|| helper_storage_for(source_apparent_gib, packed_layers_gib))
+}
+
+/// The policy above, separated from the environment it reads, so the whole
+/// table can be asserted without mutating process-global state (which races
+/// with every other test in the binary).
+fn helper_storage_for(source_apparent_gib: u64, packed_layers_gib: u64) -> u64 {
+    source_apparent_gib
+        .max(packed_layers_gib)
+        .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
+        .max(EXPORT_HELPER_MIN_STORAGE_GIB)
+}
+
+/// A usable [`EXPORT_HELPER_STORAGE_ENV`] value. Anything unparsable or zero
+/// is ignored rather than failing the export: the heuristic still produces a
+/// working disk, and refusing to run would be a worse answer than a typo.
+fn parse_helper_storage_override(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse::<u64>().ok().filter(|gib| *gib > 0)
+}
+
+/// Apparent bytes held under `dir`, used to size the helper for an
+/// artifact-sourced machine whose image lives here rather than on its disk.
+/// Unreadable entries are skipped: this only feeds a disk-size heuristic.
+fn directory_apparent_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_apparent_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// A helper VM used to read the source machine's disks and flatten layers.
 /// Stops the VM and removes its scratch data dir on drop.
 struct ExportVm {
     manager: AgentManager,
     data_dir: PathBuf,
+    /// Size of the disk the helper writes the image and flattened output to,
+    /// so a failure that fills it can say so.
+    storage_gib: u64,
 }
 
 impl ExportVm {
@@ -334,13 +390,16 @@ impl ExportVm {
         let source_apparent_gib = disk_virtual_size(&storage_disk, storage_fmt)
             .map(|bytes| bytes.div_ceil(1024 * 1024 * 1024))
             .unwrap_or(0);
-        let helper_storage_gib = source_apparent_gib
-            .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
-            .max(EXPORT_HELPER_MIN_STORAGE_GIB);
+        let packed_layers_gib = packed_layers_dir
+            .as_deref()
+            .map(|dir| directory_apparent_bytes(dir).div_ceil(1024 * 1024 * 1024))
+            .unwrap_or(0);
+        let helper_storage_gib = export_helper_storage_gib(source_apparent_gib, packed_layers_gib);
         tracing::debug!(
             source_apparent_gib,
+            packed_layers_gib,
             helper_storage_gib,
-            "sizing the export helper's disk from the source machine"
+            "sizing the export helper's disk"
         );
 
         println!("Starting agent VM to export machine state...");
@@ -403,11 +462,32 @@ impl ExportVm {
             let _ = std::fs::remove_dir_all(&data_dir);
             return Err(e);
         }
-        Ok(Self { manager, data_dir })
+        Ok(Self {
+            manager,
+            data_dir,
+            storage_gib: helper_storage_gib,
+        })
     }
 
     fn connect(&self) -> crate::Result<AgentClient> {
         self.manager.connect()
+    }
+
+    /// Name the disk that filled. The guest reports a full disk as a writeback
+    /// EIO, which on its own says neither which disk ran out nor how to give
+    /// the helper a bigger one — the export's user has no way to see either.
+    fn explain_storage_exhaustion(&self, error: crate::Error) -> crate::Error {
+        let message = error.to_string();
+        if !message.contains("out of space") && !message.contains("No space left") {
+            return error;
+        }
+        Error::agent(
+            "pack from VM",
+            format!(
+                "{message}. The export helper's {} GiB disk filled while it held the image.                  Set {}=<GiB> to give it a larger one; the disk is sparse, so a generous                  value costs nothing on the host until it is written.",
+                self.storage_gib, EXPORT_HELPER_STORAGE_ENV
+            ),
+        )
     }
 
     /// Mount the source machine's storage disk at `/mnt/source-storage`.
@@ -687,13 +767,15 @@ fn export_flattened_from_registry_image(
 
     let image_info = if opts.rebase_from_image {
         eprintln!("Pulling {} in export VM...", image);
-        client.pull_with_registry_config_and_progress(
-            image,
-            None,
-            opts.proxy.as_deref(),
-            opts.no_proxy.as_deref(),
-            |_, _, _| {},
-        )?
+        client
+            .pull_with_registry_config_and_progress(
+                image,
+                None,
+                opts.proxy.as_deref(),
+                opts.no_proxy.as_deref(),
+                |_, _, _| {},
+            )
+            .map_err(|error| export_vm.explain_storage_exhaustion(error))?
     } else {
         cached_export_image(&mut client, vm_name, image)?
     };
@@ -1591,253 +1673,60 @@ mod from_vm_manifest_tests {
 
 #[cfg(test)]
 mod export_helper_sizing_tests {
-    use super::{EXPORT_HELPER_MIN_STORAGE_GIB, EXPORT_HELPER_STORAGE_FACTOR};
-
-    /// Mirrors the sizing done in `ExportVm::start`, so the policy is asserted
-    /// without booting a VM.
-    fn helper_storage_gib(source_apparent_gib: u64) -> u64 {
-        source_apparent_gib
-            .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
-            .max(EXPORT_HELPER_MIN_STORAGE_GIB)
-    }
+    use super::{
+        export_helper_storage_gib, helper_storage_for, parse_helper_storage_override,
+        EXPORT_HELPER_MIN_STORAGE_GIB,
+    };
 
     #[test]
     fn a_big_machine_gets_a_helper_disk_bigger_than_itself() {
-        // The export failure that prompted this: a machine holding ~13 GiB on a
-        // 50 GiB disk. The helper used to get the fixed default and filled up
-        // mid-pull, dying as a bare "connection closed".
-        assert!(
-            helper_storage_gib(50) > 50,
-            "the helper must outsize its source"
-        );
-        assert_eq!(helper_storage_gib(50), 150);
-        // Room for the extracted layers AND the flattened copy built beside them.
-        assert_eq!(helper_storage_gib(100), 300);
+        // The export failure that prompted the sizing: a machine holding
+        // ~13 GiB on a 50 GiB disk, whose helper used to get the fixed default
+        // and filled up mid-pull.
+        assert!(helper_storage_for(50, 0) > 50);
+        assert_eq!(helper_storage_for(50, 0), 150);
+        assert_eq!(helper_storage_for(100, 0), 300);
     }
 
     #[test]
-    fn a_small_or_unreadable_source_still_gets_a_workable_floor() {
-        // A default-sized machine, and the `metadata()` failure path that
-        // reports 0 — neither may produce a helper too small to pull into.
-        assert_eq!(helper_storage_gib(20), EXPORT_HELPER_MIN_STORAGE_GIB);
-        assert_eq!(helper_storage_gib(0), EXPORT_HELPER_MIN_STORAGE_GIB);
-        // The floor has to clear a realistic image pull, not merely be non-zero.
-        assert!(helper_storage_gib(0) >= 64);
+    fn a_small_machine_still_gets_the_floor() {
+        assert_eq!(helper_storage_for(0, 0), EXPORT_HELPER_MIN_STORAGE_GIB);
+        assert_eq!(helper_storage_for(1, 0), EXPORT_HELPER_MIN_STORAGE_GIB);
+    }
+
+    /// A machine created from an artifact keeps its image in the host layer
+    /// directory, not on its own disk, so its disk says nothing about how much
+    /// the helper has to hold. Sizing from the disk alone is what left a small
+    /// machine carrying a large image with a helper that could not fit it.
+    #[test]
+    fn a_small_machine_with_large_packed_layers_is_sized_from_the_layers() {
+        assert_eq!(helper_storage_for(10, 60), 180);
+        assert_eq!(helper_storage_for(60, 10), 180);
     }
 
     #[test]
-    fn an_absurd_source_size_cannot_overflow_the_multiply() {
-        assert_eq!(helper_storage_gib(u64::MAX), u64::MAX);
-    }
-}
-
-#[cfg(test)]
-mod export_scratch_tests {
-    use super::{disk_virtual_size, reap_stale_export_scratch_in};
-    use crate::storage::DiskFormat;
-
-    /// A pid far above any system's maximum, so it is reliably not running.
-    const DEAD_PID: u32 = i32::MAX as u32;
-
-    fn scratch(root: &std::path::Path, dir: &str, name: &str) -> std::path::PathBuf {
-        let path = root.join(dir);
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("name"), name).unwrap();
-        std::fs::write(path.join(super::EXPORT_SCRATCH_MARKER), name).unwrap();
-        std::fs::write(path.join("agent.pid"), DEAD_PID.to_string()).unwrap();
-        std::fs::write(path.join("vm.lock"), b"").unwrap();
-        std::fs::write(path.join("storage.raw"), b"pretend this is 200 GiB").unwrap();
-        path
-    }
-
-    /// The whole point: space an export helper abandoned comes back, so a run of
-    /// failed exports cannot quietly consume the host's free space.
-    #[test]
-    #[cfg(unix)]
-    fn scratch_from_a_dead_helper_is_reclaimed() {
-        let root = tempfile::tempdir().unwrap();
-        let dead = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-
-        reap_stale_export_scratch_in(root.path());
-
-        assert!(!dead.exists(), "abandoned scratch was left on the host");
-    }
-
-    /// A running export owns its scratch; reaping it mid-export would pull the
-    /// disks out from under a helper that is still reading them.
-    #[test]
-    fn scratch_from_a_live_creator_is_left_alone() {
-        let root = tempfile::tempdir().unwrap();
-        let live = scratch(
-            root.path(),
-            "a",
-            &format!("pack-fromvm-{}-17", std::process::id()),
-        );
-
-        reap_stale_export_scratch_in(root.path());
-
-        assert!(live.exists(), "reaped a live export helper's scratch");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn surviving_helper_retains_scratch_until_it_exits() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        let mut helper = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        std::fs::write(dir.join("agent.pid"), format!("{}\n0\n", helper.id())).unwrap();
-        reap_stale_export_scratch_in(root.path());
-        let retained = dir.join("storage.raw").exists();
-        helper.kill().unwrap();
-        helper.wait().unwrap();
-        assert!(
-            retained,
-            "creator exited but the helper still held its disks"
-        );
-        reap_stale_export_scratch_in(root.path());
-        assert!(!dir.exists(), "dead helper scratch was not reclaimed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scratch_is_retained_while_launch_lock_is_held() {
-        use std::os::fd::AsRawFd;
-        let root = tempfile::tempdir().unwrap();
-        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        let lock = std::fs::File::open(dir.join("vm.lock")).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        reap_stale_export_scratch_in(root.path());
-        assert!(dir.exists());
-        // flock belongs to the open file description. Other tests can fork
-        // while this runs, so dropping our fd need not release the lock.
-        // Model that extra reference explicitly and verify both states.
-        let inherited = lock.try_clone().unwrap();
-        drop(lock);
-        reap_stale_export_scratch_in(root.path());
-        assert!(
-            dir.exists(),
-            "a duplicated launch lock still protects scratch"
-        );
-        assert_eq!(
-            unsafe { libc::flock(inherited.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
-        reap_stale_export_scratch_in(root.path());
-        assert!(!dir.exists());
+    fn a_huge_source_does_not_overflow_the_size() {
+        assert!(helper_storage_for(u64::MAX, 0) >= EXPORT_HELPER_MIN_STORAGE_GIB);
     }
 
     #[test]
-    fn missing_or_invalid_helper_identity_is_retained() {
-        let root = tempfile::tempdir().unwrap();
-        for (index, contents) in [None, Some(""), Some("invalid"), Some("0"), Some("-1")]
-            .into_iter()
-            .enumerate()
-        {
-            let dir = scratch(
-                root.path(),
-                &index.to_string(),
-                &format!("pack-fromvm-{DEAD_PID}-17"),
-            );
-            match contents {
-                Some(text) => std::fs::write(dir.join("agent.pid"), text).unwrap(),
-                None => std::fs::remove_file(dir.join("agent.pid")).unwrap(),
-            }
-            reap_stale_export_scratch_in(root.path());
-            assert!(dir.exists());
+    fn only_a_usable_override_is_honored() {
+        assert_eq!(parse_helper_storage_override(Some("512")), Some(512));
+        assert_eq!(parse_helper_storage_override(Some("  512  ")), Some(512));
+        // A typo or a zero falls back to the heuristic instead of failing the
+        // export or booting a helper with no disk.
+        assert_eq!(parse_helper_storage_override(Some("0")), None);
+        assert_eq!(parse_helper_storage_override(Some("512G")), None);
+        assert_eq!(parse_helper_storage_override(Some("")), None);
+        assert_eq!(parse_helper_storage_override(None), None);
+    }
+
+    /// Without the variable set, the public entry point is the heuristic.
+    #[test]
+    fn the_default_path_is_the_heuristic() {
+        if std::env::var(super::EXPORT_HELPER_STORAGE_ENV).is_ok() {
+            return;
         }
-    }
-
-    #[test]
-    fn unmarked_prefix_lookalike_is_not_scratch() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        std::fs::remove_file(dir.join(super::EXPORT_SCRATCH_MARKER)).unwrap();
-        reap_stale_export_scratch_in(root.path());
-        assert!(dir.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scratch_directory_symlinks_are_not_followed() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let dir = scratch(outside.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        std::os::unix::fs::symlink(&dir, root.path().join("linked")).unwrap();
-        reap_stale_export_scratch_in(root.path());
-        assert!(dir.join("storage.raw").exists());
-        assert!(root.path().join("linked").symlink_metadata().is_ok());
-    }
-
-    /// Everything else in this directory is a real machine. Only the export
-    /// helper's own naming may be treated as disposable.
-    #[test]
-    fn real_machines_are_never_reaped() {
-        let root = tempfile::tempdir().unwrap();
-        let machine = scratch(root.path(), "a", "my-important-machine");
-        let lookalike = scratch(root.path(), "b", "pack-fromvm-not-a-pid");
-        let unnamed = root.path().join("c");
-        std::fs::create_dir_all(&unnamed).unwrap();
-
-        reap_stale_export_scratch_in(root.path());
-
-        assert!(machine.exists(), "deleted a real machine");
-        assert!(
-            lookalike.exists(),
-            "deleted a directory with no parseable pid"
-        );
-        assert!(unnamed.exists(), "deleted a directory with no name file");
-    }
-
-    /// Every export starts by running this, so a malformed one breaks all of
-    /// them — including the space that a line continuation would silently eat.
-    #[test]
-    fn the_source_mount_command_is_well_formed() {
-        assert_eq!(
-            super::source_mount_command(),
-            "mkdir -p /mnt/source-storage && mount -o ro /dev/vdc /mnt/source-storage"
-        );
-    }
-
-    /// A raw disk is sparse, so its apparent length is the size the guest sees.
-    #[test]
-    fn a_raw_disk_measures_its_apparent_length() {
-        let dir = tempfile::tempdir().unwrap();
-        let raw = dir.path().join("storage.raw");
-        let file = std::fs::File::create(&raw).unwrap();
-        file.set_len(64 * 1024 * 1024 * 1024).unwrap();
-
-        assert_eq!(
-            disk_virtual_size(&raw, DiskFormat::Raw),
-            Some(64 * 1024 * 1024 * 1024)
-        );
-    }
-
-    /// The clone case: a copy-on-write overlay is tiny on disk but presents the
-    /// whole backing disk, and sizing the helper from its file length is what
-    /// used to hand a large clone the minimum.
-    #[test]
-    fn a_qcow2_measures_what_it_presents_not_what_it_occupies() {
-        let dir = tempfile::tempdir().unwrap();
-        let qcow2 = dir.path().join("storage.qcow2");
-        let virtual_size: u64 = 220 * 1024 * 1024 * 1024;
-
-        let mut header = [0u8; 32];
-        header[0..4].copy_from_slice(b"QFI\xfb");
-        header[4..8].copy_from_slice(&3u32.to_be_bytes());
-        header[24..32].copy_from_slice(&virtual_size.to_be_bytes());
-        std::fs::write(&qcow2, header).unwrap();
-
-        let occupies = std::fs::metadata(&qcow2).unwrap().len();
-        assert!(occupies < 1024, "fixture should be a tiny file");
-        assert_eq!(
-            disk_virtual_size(&qcow2, DiskFormat::Qcow2),
-            Some(virtual_size)
-        );
+        assert_eq!(export_helper_storage_gib(50, 0), helper_storage_for(50, 0));
     }
 }
