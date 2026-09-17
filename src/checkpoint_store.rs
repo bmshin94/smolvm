@@ -978,6 +978,8 @@ pub fn materialize_with_base(
         // Size the file first: ranges no worker writes stay holes (or keep
         // the base's bytes, which the diff below has checked are identical).
         file.set_len(entry.size)?;
+        let data_map = cloned.then(|| chunk_data_map(&file, entry.size)).flatten();
+        let data_map = data_map.as_ref();
         let base_chunks: &[Option<String>] = match (&base_entry, cloned) {
             (Some((_, base)), true) => &base.chunks,
             _ => &[],
@@ -1010,7 +1012,13 @@ pub fn materialize_with_base(
                 // private clone so a later change to the base cannot race
                 // verification against use.
                 if unchanged
-                    && cloned_chunk_matches(&file, offset, count, hash.map(String::as_str))?
+                    && cloned_chunk_matches(
+                        &file,
+                        data_map,
+                        offset,
+                        count,
+                        hash.map(String::as_str),
+                    )?
                 {
                     reused.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
@@ -1111,21 +1119,68 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
 
 const BASE_LOCK: &str = ".lock";
 
+/// Which chunks of `file` hold data, from a single walk of its extents.
+///
+/// Verification only has to tell a hole from data, and `SEEK_DATA` answers
+/// that — but it takes the file's lock, so asking once per chunk from every
+/// worker turns a second of verification into half a minute of contention on
+/// a sparse multi-gigabyte disk. Walking the extents once is a few hundred
+/// seeks for the whole file and leaves the workers lock-free.
+///
+/// `None` where the filesystem cannot report extents: callers then verify by
+/// reading, exactly as before.
+fn chunk_data_map(file: &File, size: u64) -> Option<Vec<bool>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        let mut has_data = vec![false; size.div_ceil(CHUNK_SIZE as u64) as usize];
+        let mut offset = 0i64;
+        while (offset as u64) < size {
+            let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+            if data < 0 {
+                // No data at or after this offset: the rest is a hole.
+                return match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENXIO) => Some(has_data),
+                    _ => None,
+                };
+            }
+            let end = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            if end < 0 {
+                return None;
+            }
+            let first = data as u64 / CHUNK_SIZE as u64;
+            let last = (end as u64).min(size).div_ceil(CHUNK_SIZE as u64);
+            for chunk in has_data.iter_mut().take(last as usize).skip(first as usize) {
+                *chunk = true;
+            }
+            if end <= data {
+                return None;
+            }
+            offset = end;
+        }
+        Some(has_data)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, size);
+        None
+    }
+}
+
 fn cloned_chunk_matches(
     file: &File,
+    data_map: Option<&Vec<bool>>,
     offset: u64,
     count: usize,
     hash: Option<&str>,
 ) -> io::Result<bool> {
-    #[cfg(unix)]
-    if hash.is_none() {
-        use std::os::fd::AsRawFd;
-        // A real filesystem hole is intrinsically zero; avoid reading it.
-        // All data access elsewhere is positional, so lseek's cursor is unused.
-        let data = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
-        if (data >= 0 && data as u64 >= offset + count as u64)
-            || (data < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO))
-        {
+    // A hole is intrinsically zero, so where the extent map says this range
+    // holds none, there is nothing to read back.
+    if let (None, Some(map)) = (hash, data_map) {
+        let first = (offset / CHUNK_SIZE as u64) as usize;
+        let last = ((offset + count as u64).div_ceil(CHUNK_SIZE as u64) as usize).min(map.len());
+        if !map[first..last].iter().any(|held| *held) {
             return Ok(true);
         }
     }
@@ -1489,20 +1544,81 @@ mod tests {
         }
     }
 
+    /// The extent map is what keeps verification off the per-chunk seek that
+    /// serialized every worker on the file's lock: it must call a hole a hole,
+    /// call data data, and — because a base whose file disagrees with its
+    /// index is exactly what verification exists to catch — still refuse a
+    /// range the map reports as holding data.
+    #[cfg(unix)]
+    #[test]
+    fn the_extent_map_distinguishes_holes_from_data_without_reading() {
+        use std::os::unix::fs::FileExt;
+        // The hole has to be large enough for the filesystem to keep as one:
+        // a gap of a chunk or two is smaller than APFS's allocation grain and
+        // comes back as data, which is safe (it only costs a read-back) but
+        // would make this test assert nothing.
+        const CHUNKS: usize = 66;
+        const LAST: usize = CHUNKS - 1;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sparse.img");
+        let file = File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let size = CHUNKS as u64 * CHUNK_SIZE as u64;
+        file.set_len(size).unwrap();
+        file.write_all_at(&vec![0xA5; CHUNK_SIZE], 0).unwrap();
+        file.write_all_at(&vec![0x5A; CHUNK_SIZE], LAST as u64 * CHUNK_SIZE as u64)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let Some(map) = chunk_data_map(&file, size) else {
+            // A filesystem that cannot report extents falls back to reading,
+            // which the sibling test already covers.
+            return;
+        };
+        assert_eq!(map.len(), CHUNKS);
+        assert!(map[0] && map[LAST], "written chunks hold data: {map:?}");
+        let middle = CHUNKS / 2;
+        if map[middle] {
+            // This filesystem did not keep the gap as a hole; nothing to assert.
+            return;
+        }
+
+        // A hole the map knows about needs no read-back.
+        let hole_offset = middle as u64 * CHUNK_SIZE as u64;
+        assert!(cloned_chunk_matches(&file, Some(&map), hole_offset, CHUNK_SIZE, None).unwrap());
+        // A chunk the map reports as data is not accepted as a hole: the
+        // caller punches it instead of leaving the base's bytes behind.
+        assert!(!cloned_chunk_matches(&file, Some(&map), 0, CHUNK_SIZE, None).unwrap());
+        // Data chunks still verify against their hash, map or not.
+        let first = vec![0xA5; CHUNK_SIZE];
+        assert!(
+            cloned_chunk_matches(&file, Some(&map), 0, CHUNK_SIZE, Some(&digest(&first))).unwrap()
+        );
+        assert!(
+            !cloned_chunk_matches(&file, Some(&map), 0, CHUNK_SIZE, Some(&digest(b"other")))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn cloned_chunk_verification_checks_data_holes_and_short_reads() {
         let file = tempfile::tempfile().unwrap();
         file.set_len((2 * CHUNK_SIZE) as u64).unwrap();
         let bytes = vec![7; CHUNK_SIZE];
         write_at(&file, 0, &bytes).unwrap();
-        assert!(cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
-        assert!(cloned_chunk_matches(&file, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
+        assert!(cloned_chunk_matches(&file, None, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
+        assert!(cloned_chunk_matches(&file, None, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
         write_at(&file, 0, &[9]).unwrap();
-        assert!(!cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
+        assert!(!cloned_chunk_matches(&file, None, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
         write_at(&file, CHUNK_SIZE as u64, &[9]).unwrap();
-        assert!(!cloned_chunk_matches(&file, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
+        assert!(!cloned_chunk_matches(&file, None, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
         file.set_len(17).unwrap();
-        assert!(cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).is_err());
+        assert!(cloned_chunk_matches(&file, None, 0, CHUNK_SIZE, Some(&digest(&bytes))).is_err());
     }
 
     #[test]
