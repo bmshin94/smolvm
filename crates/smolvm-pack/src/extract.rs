@@ -1204,7 +1204,12 @@ fn safe_unpack_with_policy<R: Read>(
         if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
         }
-        if owner_xattr && entry_type != tar::EntryType::Link {
+        // Hard links share their target's xattr; symlinks cannot carry user
+        // xattrs on Linux and the server reads the host's stat for them anyway.
+        if owner_xattr
+            && entry_type != tar::EntryType::Link
+            && entry_type != tar::EntryType::Symlink
+        {
             // The archived owner and mode (setuid bits included) go in the
             // xattr the guest sees; the host copy stays readable so the VMM
             // serving the files can open them.
@@ -1217,12 +1222,10 @@ fn safe_unpack_with_policy<R: Read>(
             // Setting a user xattr needs write permission on the file, and
             // the host copy must stay readable for the VMM, so the host mode
             // always keeps owner read/write (the guest sees the archived one).
-            if entry_type != tar::EntryType::Symlink {
-                set_mode(
-                    &full_path,
-                    (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
-                );
-            }
+            set_mode(
+                &full_path,
+                (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
+            );
             record_override_stat(&full_path, uid, gid, archived)?;
         }
         report.entries += 1;
@@ -5150,7 +5153,6 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    #[cfg(unix)]
     #[test]
     fn host_layers_gate_needs_a_pack_whose_agent_mounts_userxattr() {
         assert!(!packed_agent_mounts_userxattr("1.16.1"));
@@ -5313,7 +5315,10 @@ mod tests {
         assert_eq!(xattr("private").as_deref(), Some("1000:1000:0700"));
         assert_eq!(xattr("private/secret").as_deref(), Some("1000:1000:0600"));
         assert_eq!(xattr("bin/passwd").as_deref(), Some("0:0:04755"));
-        assert_eq!(xattr("bin/ln").as_deref(), Some("0:0:0777"));
+        assert!(
+            dest.join("bin/ln").is_symlink(),
+            "symlinks are extracted, never stamped"
+        );
         assert_eq!(
             xattr("bin/gone").as_deref(),
             Some("0:0:020000"),
@@ -5344,6 +5349,7 @@ mod tests {
         assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_create_or_copy_storage_disk_preserves_sparseness() {
         use std::os::unix::fs::MetadataExt;
