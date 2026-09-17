@@ -420,6 +420,74 @@ mod tests {
         assert!(cache.get(c).is_some());
     }
 
+    /// `last_used` is where the upgrade path lives: a blob cached before
+    /// markers existed has none, and its recency must come from the atime the
+    /// old scheme maintained rather than collapsing to the epoch.
+    #[test]
+    fn last_used_falls_back_to_atime_when_no_marker_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let blob = cache.put(digest, b"payload").unwrap();
+        let atime = filetime::FileTime::from_unix_time(1_600_000_500, 0);
+        filetime::set_file_atime(&blob, atime).unwrap();
+        assert!(!lru_marker_path(&blob).exists());
+
+        let from_atime = last_used(&blob, &fs::metadata(&blob).unwrap());
+        assert_ne!(
+            from_atime,
+            std::time::UNIX_EPOCH,
+            "a pre-marker blob must not read as epoch-old"
+        );
+        assert_eq!(
+            from_atime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_500)
+        );
+
+        note_used(&blob);
+        let marker = filetime::FileTime::from_unix_time(1_600_009_000, 0);
+        filetime::set_file_mtime(lru_marker_path(&blob), marker).unwrap();
+        assert_eq!(
+            last_used(&blob, &fs::metadata(&blob).unwrap()),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_009_000),
+            "once a marker exists it is the authority"
+        );
+    }
+
+    /// An upgraded node holds a mix: blobs read since the upgrade have markers,
+    /// the rest carry only their old atime. Eviction must order the two kinds
+    /// against each other, or the untouched-but-hot half of a warm cache is
+    /// thrown away first and re-pulled.
+    #[test]
+    fn eviction_orders_pre_marker_blobs_against_marked_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 250).unwrap();
+        let unmarked = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let marked = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let fresh = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        let unmarked_path = cache.put(unmarked, &[0u8; 100]).unwrap();
+        let marked_path = cache.put(marked, &[0u8; 100]).unwrap();
+        let t = |secs: i64| filetime::FileTime::from_unix_time(1_600_000_000 + secs, 0);
+        // Pre-marker blob, read recently under the old scheme.
+        filetime::set_file_atime(&unmarked_path, t(900)).unwrap();
+        assert!(!lru_marker_path(&unmarked_path).exists());
+        // Marked blob, last read long before that.
+        note_used(&marked_path);
+        filetime::set_file_mtime(lru_marker_path(&marked_path), t(1)).unwrap();
+
+        cache.put(fresh, &[0u8; 100]).unwrap();
+
+        assert!(
+            cache.get(unmarked).is_some(),
+            "a pre-marker blob read recently outranks a marked blob read long ago"
+        );
+        assert!(
+            cache.get(marked).is_none(),
+            "the genuinely least recently used blob is the one evicted"
+        );
+        assert!(cache.get(fresh).is_some());
+    }
+
     #[test]
     fn test_prune_all() {
         let tmp = tempfile::tempdir().unwrap();
