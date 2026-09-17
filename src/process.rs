@@ -3260,6 +3260,78 @@ mod tests {
         assert!(is_alive(pid));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreaped_child_fixture() {
+        let Some(path) = std::env::var_os("SMOLVM_TEST_UNREAPED_CHILD_PID") else {
+            return;
+        };
+        // Isolated test process: the child calls only async-signal-safe _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        std::fs::write(path, pid.to_string()).unwrap();
+        let mut release = [0];
+        let _ = std::io::Read::read_exact(&mut std::io::stdin(), &mut release);
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_child_owned_by_another_process_is_not_alive() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // EOF releases the fixture to reap its own child, even if an
+                // assertion below fails. Never reap another caller's child.
+                drop(self.0.stdin.take());
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("child.pid");
+        let mut fixture = Fixture(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::unreaped_child_fixture",
+                    "--nocapture",
+                ])
+                .env("SMOLVM_TEST_UNREAPED_CHILD_PID", &pid_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            assert!(
+                fixture.0.try_wait().unwrap().is_none(),
+                "fixture exited early"
+            );
+            if let Some(pid) = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|text| text.parse::<Pid>().ok())
+            {
+                if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    if stat.rsplit_once(") ").unwrap().1.starts_with("Z ") {
+                        break pid;
+                    }
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "fixture never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "PID must still exist");
+        assert!(
+            try_wait(pid).is_none(),
+            "this process must not own the child"
+        );
+        assert!(!is_alive(pid), "an unreaped exit is not a running VM");
+    }
+
     #[test]
     fn test_is_alive_nonexistent() {
         // PID 99999999 is unlikely to exist
