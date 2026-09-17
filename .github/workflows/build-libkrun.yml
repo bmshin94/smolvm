@@ -16,6 +16,10 @@ name: Build libkrun (linux, glibc 2.35)
 on:
   workflow_dispatch:
     inputs:
+      macos_only:
+        description: "Build only the macOS runtime bundle."
+        type: boolean
+        default: false
       rebuild_libkrunfw:
         description: "Rebuild libkrunfw from source (full guest-kernel rebuild) instead of reusing the committed .so. Needed when a libkrunfw patch changed the guest kernel."
         type: boolean
@@ -23,6 +27,7 @@ on:
 
 jobs:
   build:
+    if: ${{ !inputs.macos_only }}
     name: libkrun ${{ matrix.arch }}
     strategy:
       fail-fast: false
@@ -81,6 +86,7 @@ jobs:
   # must still match the pin so an unrelated release cannot silently retain an
   # older runtime.
   windows-libkrun:
+    if: ${{ !inputs.macos_only }}
     name: libkrun windows-x86_64
     runs-on: ubuntu-22.04
     env:
@@ -120,7 +126,7 @@ jobs:
   # runs when refreshing libkrunfw, since the .dll wraps the guest kernel.
   windows-libkrunfw:
     name: libkrunfw.dll (windows cross)
-    if: ${{ inputs.rebuild_libkrunfw }}
+    if: ${{ inputs.rebuild_libkrunfw && !inputs.macos_only }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -146,4 +152,40 @@ jobs:
         with:
           name: libkrunfw-windows-x86_64
           path: libkrunfw/libkrunfw.dll
+          if-no-files-found: error
+
+  macos-libkrun:
+    name: libkrun darwin-arm64
+    if: ${{ inputs.macos_only }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          brew trust --tap libkrun/krun
+          brew tap libkrun/krun
+          brew install llvm lld xz virglrenderer
+
+      - name: Build and sign the bundled runtime
+        run: |
+          make -C libkrun smolvm
+          ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
+          codesign --verify --strict --verbose=2 lib/libkrun.dylib
+          otool -L lib/libkrun.dylib
+          shasum -a 256 lib/libkrun.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-darwin-arm64
+          path: |
+            lib/libkrun.dylib
+            lib/libkrun.provenance
           if-no-files-found: error
