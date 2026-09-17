@@ -16,6 +16,10 @@ name: Build libkrun (linux, glibc 2.35)
 on:
   workflow_dispatch:
     inputs:
+      windows_only:
+        description: "Build only the Windows runtime bundle."
+        type: boolean
+        default: false
       macos_runtime_run:
         description: "Build only the macOS QA engine using the runtime artifact from this workflow run ID."
         type: string
@@ -31,7 +35,7 @@ on:
 
 jobs:
   build:
-    if: ${{ !inputs.macos_only && inputs.macos_runtime_run == '' }}
+    if: ${{ !inputs.windows_only && !inputs.macos_only && inputs.macos_runtime_run == '' }}
     name: libkrun ${{ matrix.arch }}
     strategy:
       fail-fast: false
@@ -116,6 +120,7 @@ jobs:
           # Keep the canonical Make feature/build path; override its Linux
           # output locations for this Windows cross-compilation artifact.
           make -C libkrun BLK=1 NET=1 \
+            FEATURE_FLAGS='--features blk,net --package libkrun' \
             KRUN_BASE_Linux=../x86_64-pc-windows-gnu/release/krun.dll \
             LIBRARY_RELEASE_Linux=target/krun-windows.dll target/krun-windows.dll
           cp libkrun/target/krun-windows.dll lib/windows-x86_64/krun.dll
