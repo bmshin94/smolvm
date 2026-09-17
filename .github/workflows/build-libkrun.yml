@@ -178,10 +178,13 @@ jobs:
         run: |
           # Compile with installed headers, but link the same patched graphics
           # libraries that ship with SmolVM, not Homebrew's upstream ABI.
-          mkdir -p "$RUNNER_TEMP/krun-pkgconfig"
+          mkdir -p "$RUNNER_TEMP/krun-pkgconfig" "$RUNNER_TEMP/krun-link-libs"
+          ln -s "$GITHUB_WORKSPACE/lib/libepoxy.0.dylib" "$RUNNER_TEMP/krun-link-libs/libepoxy.dylib"
+          ln -s "$GITHUB_WORKSPACE/lib/libvirglrenderer.1.dylib" "$RUNNER_TEMP/krun-link-libs/libvirglrenderer.dylib"
+          nm -gU "$GITHUB_WORKSPACE/lib/libvirglrenderer.1.dylib" | grep ' _virgl_renderer_resource_get_map_ptr$'
           for dependency in virglrenderer epoxy; do
             pc_dir="$(pkg-config --variable=pcfiledir "$dependency")"
-            sed "s|^libdir=.*|libdir=$GITHUB_WORKSPACE/lib|" \
+            sed "s|^libdir=.*|libdir=$RUNNER_TEMP/krun-link-libs|" \
               "$pc_dir/$dependency.pc" > "$RUNNER_TEMP/krun-pkgconfig/$dependency.pc"
           done
           export PKG_CONFIG_PATH="$RUNNER_TEMP/krun-pkgconfig"
