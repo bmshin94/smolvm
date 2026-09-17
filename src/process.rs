@@ -1868,9 +1868,40 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
 /// Check if a process is alive.
 ///
 /// Returns true if the process exists and is running.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn is_alive(pid: Pid) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Check whether a Linux process may still be running.
+///
+/// An exited, unreaped child is not alive; inaccessible process state is
+/// treated conservatively as alive without reaping another owner's child.
+#[cfg(target_os = "linux")]
+pub fn is_alive(pid: Pid) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        // Permission to signal a process is independent of its liveness.
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    // A CLI cannot waitpid() a VM owned by serve. An exited child still has
+    // a PID until that parent reaps it, but no workload or open files remain.
+    // Do not make cleanup depend on the parent's next supervisor tick.
+    // Unreadable or malformed procfs data is not evidence of exit.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|stat| !linux_stat_has_exited(&stat))
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stat_has_exited(stat: &str) -> bool {
+    matches!(
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.split_ascii_whitespace().next()),
+        Some("Z" | "X" | "x")
+    )
 }
 
 /// Check if a process is alive (Windows).
@@ -3330,6 +3361,35 @@ mod tests {
             "this process must not own the child"
         );
         assert!(!is_alive(pid), "an unreaped exit is not a running VM");
+        assert!(stop_vm_process(pid, Duration::ZERO, Duration::ZERO).is_ok());
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "owner must still reap its child"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_state_requires_a_complete_procfs_state_field() {
+        for state in ["Z", "X", "x"] {
+            assert!(linux_stat_has_exited(&format!(
+                "123 (worker) {state} 1 2 3"
+            )));
+        }
+        for stat in [
+            "123 (worker) R 1 2 3",
+            "123 (worker) D 1 2 3",
+            "123 (worker) T 1 2 3",
+            "123 (name with ) Z inside) S 1 2 3",
+            "123 (worker) Zombie 1 2 3",
+            "123 (worker) ",
+            "unreadable",
+        ] {
+            assert!(!linux_stat_has_exited(stat), "{stat}");
+        }
+        assert!(!is_alive(0));
+        assert!(!is_alive(-1));
     }
 
     #[test]
