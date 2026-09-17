@@ -8,6 +8,28 @@
 use crate::util::{libkrun_filename, libkrunfw_filename};
 use std::path::{Path, PathBuf};
 
+/// Serve ownership and mode from the `user.containers.override_stat` xattr
+/// (see libkrun's `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`).
+pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
+
+/// Whether the libkrun this binary would load can serve host-extracted image
+/// layers with their recorded ownership: on macOS and Windows the server
+/// always does; on Linux it needs `krun_add_virtiofs4`. Registered with the
+/// pack crate so extraction can choose that path.
+pub fn host_layers_supported() -> bool {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        return true;
+    }
+    let Some(lib_dir) = crate::agent::launcher::find_lib_dir() else {
+        return false;
+    };
+    // SAFETY: loading libkrun has no side effects beyond dlopen; nothing is
+    // called through the loaded functions here.
+    unsafe { KrunFunctions::load(&lib_dir) }
+        .map(|krun| krun.add_virtiofs4.is_some())
+        .unwrap_or(false)
+}
+
 /// Function pointers loaded from libkrun.
 ///
 /// Required symbols are loaded eagerly. Optional symbols are exposed as
@@ -55,6 +77,11 @@ pub struct KrunFunctions {
     pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
     pub add_virtiofs3: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
+    >,
+    /// `krun_add_virtiofs3` with per-share flags; `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`
+    /// makes the Linux server present ownership from the override xattr.
+    pub add_virtiofs4: Option<
+        unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool, u32) -> i32,
     >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
     pub get_last_error: Option<unsafe extern "C" fn() -> *const libc::c_char>,
@@ -202,6 +229,7 @@ impl KrunFunctions {
         let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
+        let add_virtiofs4 = load_optional_sym!("krun_add_virtiofs4");
         let start_enter = load_sym!(krun_start_enter);
         let get_last_error = load_optional_sym!("krun_get_last_error");
         let add_vsock = load_sym!(krun_add_vsock);
@@ -239,6 +267,7 @@ impl KrunFunctions {
             add_vsock_port2,
             add_virtiofs,
             add_virtiofs3,
+            add_virtiofs4,
             start_enter,
             get_last_error,
             add_vsock,

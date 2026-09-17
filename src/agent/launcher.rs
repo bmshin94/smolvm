@@ -1884,21 +1884,45 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if layers_dir.exists() {
                 let tag = cstr("smolvm_layers");
                 let host_path = path_to_cstring(layers_dir)?;
-                let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "add packed layers virtiofs",
-                        "packed-layer DAX requires libkrun with krun_add_virtiofs3",
-                    ));
+                // Layers the host extracted itself carry their ownership in the
+                // override xattr; the Linux server presents it only when asked.
+                let override_stat = cfg!(target_os = "linux")
+                    && layers_dir
+                        .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
+                        .is_file();
+                let added = if override_stat {
+                    let Some(add_virtiofs4) = krun.add_virtiofs4 else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add packed layers virtiofs",
+                            "host-extracted layers require libkrun with krun_add_virtiofs4",
+                        ));
+                    };
+                    add_virtiofs4(
+                        ctx,
+                        tag.as_ptr(),
+                        host_path.as_ptr(),
+                        super::virtiofs::packed_layers_dax_window(),
+                        false,
+                        super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+                    )
+                } else {
+                    let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add packed layers virtiofs",
+                            "packed-layer DAX requires libkrun with krun_add_virtiofs3",
+                        ));
+                    };
+                    add_virtiofs3(
+                        ctx,
+                        tag.as_ptr(),
+                        host_path.as_ptr(),
+                        super::virtiofs::packed_layers_dax_window(),
+                        false,
+                    )
                 };
-                if add_virtiofs3(
-                    ctx,
-                    tag.as_ptr(),
-                    host_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
-                    false,
-                ) < 0
-                {
+                if added < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add packed layers virtiofs",

@@ -87,7 +87,7 @@ pub use client::{
     InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
 };
 pub use fsnotify_watch::FsNotifyWatcher;
-pub use krun::KrunFunctions;
+pub use krun::{host_layers_supported, KrunFunctions};
 pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
     LaunchFeatures, VmDisks,
