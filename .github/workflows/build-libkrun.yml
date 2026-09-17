@@ -176,6 +176,16 @@ jobs:
 
       - name: Build and sign the bundled runtime
         run: |
+          # Compile with installed headers, but link the same patched graphics
+          # libraries that ship with SmolVM, not Homebrew's upstream ABI.
+          mkdir -p "$RUNNER_TEMP/krun-pkgconfig"
+          for dependency in virglrenderer epoxy; do
+            pc_dir="$(pkg-config --variable=pcfiledir "$dependency")"
+            sed "s|^libdir=.*|libdir=$GITHUB_WORKSPACE/lib|" \
+              "$pc_dir/$dependency.pc" > "$RUNNER_TEMP/krun-pkgconfig/$dependency.pc"
+          done
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/krun-pkgconfig"
+          pkg-config --libs virglrenderer epoxy
           make -C libkrun smolvm
           ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
           codesign --verify --strict --verbose=2 lib/libkrun.dylib
